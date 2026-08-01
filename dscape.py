@@ -647,6 +647,12 @@ STREET = 0.20       # fraction of a plot given over to streets
 MIN_PLOT = 1.1      # world units below which we stop subdividing
 ROT_RATE = 0.30     # radians/second of orbit at --speed 1
 
+# Sample points around the circle the auto-fit frames. Fixed angles, not
+# angles relative to the camera, so the fit is bit-for-bit identical at every
+# azimuth rather than rippling by however much the sampling missed.
+FIT_RING = [(math.cos(i * math.pi / 12), math.sin(i * math.pi / 12))
+            for i in range(24)]
+
 
 class Bldg:
     __slots__ = ('node', 'x0', 'y0', 'x1', 'y1', 'h', 'cat', 'root', 'level')
@@ -1334,35 +1340,44 @@ def main():
             ce, se = math.cos(el), math.sin(el)
             DIST = dist_cam
 
-            def proj_raw(x, y, z):
-                xr = x * ca + y * sa
-                yr = -x * sa + y * ca
-                zv = yr * ce - z * se + DIST
-                if zv < 1.0:
-                    zv = 1.0
-                # x is scaled by SUBX: a quadrant sub-cell is half as wide as
-                # it is tall, so equal world lengths need SUBX times as many
-                # horizontal pixels as vertical ones to stay undistorted.
-                return SUBX * xr / zv, -(yr * se + z * ce) / zv, zv
-
             # ---- auto-fit: frame the city inside the area the HUD leaves ----
             # never eat so much of a narrow terminal that the city has nowhere
             # left to go: the old flat 24-column floor did exactly that
             panel = 0 if zen else min(38, max(20, cols // 3))
             panel = min(panel, max(12, cols - 22))
             hmx = max((b.h for b in blds), default=HMAX * 0.5)
+
+            # Fit the CYLINDER that circumscribes the plot, not the plot's own
+            # corners. Fitting the corners meant the frame tracked the
+            # silhouette of a rotating square, which is 41% wider corner-on
+            # than edge-on: the city pulled away as a corner came round and
+            # crept back in on the flats, a 17% breathing every quarter turn.
+            # A circle centred on the plot is rotationally symmetric, so its
+            # projection does not depend on the azimuth at all — substituting
+            # th = phi - az below leaves no `az` term — and the framing is
+            # therefore exactly constant as the camera orbits.
+            rad = PLOT * 0.7071067811865476        # (PLOT/2) * sqrt(2)
             us, vs = [], []
-            for cx_ in (-PLOT / 2, PLOT / 2):
-                for cy_ in (-PLOT / 2, PLOT / 2):
-                    for cz_ in (0.0, hmx):
-                        u, v, _ = proj_raw(cx_, cy_, cz_)
-                        us.append(u)
-                        vs.append(v)
+            for cth, sth in FIT_RING:
+                xr, yr = rad * cth, rad * sth
+                for cz_ in (0.0, hmx):
+                    zv = yr * ce - cz_ * se + DIST
+                    if zv < 1.0:
+                        zv = 1.0
+                    # x is scaled by SUBX: a quadrant sub-cell is half as wide
+                    # as it is tall, so equal world lengths need SUBX times as
+                    # many horizontal pixels as vertical ones to stay square.
+                    us.append(SUBX * xr / zv)
+                    vs.append(-(yr * se + cz_ * ce) / zv)
             du = (max(us) - min(us)) or 1e-6
             dv = (max(vs) - min(vs)) or 1e-6
             panel_px = panel * SUBX
             avail_w = pxw - panel_px - 2
-            want = min(avail_w / du, (pxh - 4) / dv) * 0.94 * zoom
+            # A constant fit has to be the safe one, so the framing now sits
+            # where the corner-on framing used to — the loosest point of the
+            # old swing. The margin was 0.94 to leave room for that swing;
+            # with nothing left to swing, some of it can go back to the city.
+            want = min(avail_w / du, (pxh - 4) / dv) * 0.97 * zoom
             ox = panel_px + avail_w / 2 - want * (min(us) + max(us)) / 2
             oy = pxh / 2 - want * (min(vs) + max(vs)) / 2
             if fit_f is None:

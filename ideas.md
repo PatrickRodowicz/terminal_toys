@@ -186,6 +186,27 @@ as the plan drifting off true. Leaving plan view always resumes spinning — the
 pause belongs to the mode, not to the orbit you left, and carrying it back out
 just looked like the city had frozen.
 
+The auto-fit had a related "nearly right" bug. It framed the city by projecting
+the eight corners of the plot, which means the frame tracked the silhouette of
+a **rotating square** — 41% wider corner-on than edge-on. So the city pulled
+away as a corner came round and crept back in on the flats: measured, a 15%
+breathing at low tilt rising to **42% at 80 degrees**, plus a centre that
+drifted as the square swung. The low-pass filter on the fit had been hiding the
+speed of it, not the fact of it.
+
+The fix is to fit the **cylinder circumscribing the plot** instead of the plot
+itself. A circle centred on the plot is rotationally symmetric, so substituting
+th = phi - az removes the azimuth from the projection algebra entirely and the
+framing is constant by construction, not merely smoothed. Measured 0.0000%
+variation over a full turn at four elevations. A constant fit has to be the
+safe one, so the framing now sits where the corner-on framing used to — the
+loosest point of the old swing — and some of the 0.94 margin went back to the
+city to compensate, since there is no longer a swing to leave room for.
+
+Worth noting what the residual measurement showed: a live orbit still moves the
+fit by ~4% *while the scan is running*, because the tallest building keeps
+changing. That one is real and should stay smoothed rather than removed.
+
 A smaller note on top of that: a key that is deliberately inert should be
 *silently* inert. Flashing "t FOR ORBIT" to explain why the arrow key did
 nothing was worse than doing nothing quietly — nobody needs to be told off by
