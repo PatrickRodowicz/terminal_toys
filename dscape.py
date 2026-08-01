@@ -36,6 +36,13 @@
    t     plan view: cranes the camera overhead and stops the spin, so the
          city flattens into a plain treemap. Tilt and pause do nothing while
          it holds. t again returns to the orbit, spinning.
+   W     street level: drops you into the streets the treemap leaves between
+         plots, outside whichever district was selected. wasd walks, the
+         arrows turn and look, and a crosshair names the building ahead —
+         ENTER steps into it, x marks it. W again returns to the orbit.
+         Note it relays the city out with wider streets while it holds: the
+         orbit layout leaves gaps too narrow to stand in, and a walker wedged
+         in one has nowhere legal to be. Same data, coarser plan.
    j k   select         ENTER descend   BKSP ascend
  Past the directory you launched in, BKSP starts a fresh scan of the parent:
  the walk only ever went downward, so there is no tree above the root.
@@ -516,11 +523,21 @@ class Raster:
         if 0 <= x < self.w and 0 <= y < self.h:
             self.px[y][x] = c
 
-    def fill(self, pts, c0, c1=None):
-        """Scanline-fill a convex polygon, lerping c0->c1 down the screen."""
+    def fill(self, pts, c0, c1=None, yref=None):
+        """Scanline-fill a convex polygon, lerping c0->c1 down the screen.
+
+        `yref` overrides the span the gradient is measured over. A polygon that
+        has been clipped against the near plane has vertices flung out to
+        ~1e5 px, so its own ymin/ymax would compress the whole visible wall
+        into one narrow slice of the ramp and it would render flat. Callers
+        that clip pass the unclipped face's screen extent instead. Defaulted,
+        so nothing that does not clip changes by a pixel.
+        """
         n = len(pts)
         ys = [p[1] for p in pts]
         ymin, ymax = min(ys), max(ys)
+        # The scan bounds always come from the polygon itself; only the
+        # gradient may be measured over a different span.
         y0 = int(math.ceil(ymin - 0.5))
         y1 = int(math.floor(ymax - 0.5))
         if y0 < 0:
@@ -529,6 +546,8 @@ class Raster:
             y1 = self.h - 1
         if y1 < y0:
             return
+        if yref is not None:
+            ymin, ymax = yref
         span = (ymax - ymin) or 1.0
         px, W = self.px, self.w
         grad = c1 is not None and c1 != c0
@@ -573,6 +592,37 @@ class Raster:
                 px[yi][xi] = c
             x += sx
             y += sy
+
+    def line_c(self, x0, y0, x1, y1, c):
+        """line(), but clipped to the viewport first (Liang-Barsky).
+
+        line() steps one pixel at a time and merely *tests* each one for being
+        on screen, which is fine when endpoints come from a camera 210 units
+        away. A near-plane clip leaves vertices at ~1e5 px, and a segment that
+        long costs tens of milliseconds to walk while painting nothing. Clip
+        the parameter range instead, then step only the part that lands.
+        """
+        dx, dy = x1 - x0, y1 - y0
+        t0, t1 = 0.0, 1.0
+        for p, q in ((-dx, x0), (dx, self.w - 1 - x0),
+                     (-dy, y0), (dy, self.h - 1 - y0)):
+            if p == 0.0:
+                if q < 0.0:
+                    return              # parallel to this edge and outside it
+            else:
+                r = q / p
+                if p < 0.0:
+                    if r > t1:
+                        return
+                    if r > t0:
+                        t0 = r
+                else:
+                    if r < t0:
+                        return
+                    if r < t1:
+                        t1 = r
+        self.line(x0 + t0 * dx, y0 + t0 * dy,
+                  x0 + t1 * dx, y0 + t1 * dy, c)
 
 
 # --- keyboard -------------------------------------------------------------
@@ -623,8 +673,25 @@ class Keyboard:
         arrows = {'A': 'UP', 'B': 'DOWN', 'C': 'RIGHT', 'D': 'LEFT'}
         while i < len(s):
             if s[i] == '\x1b' and s[i + 1:i + 2] == '[':
-                out.append(arrows.get(s[i + 2:i + 3], 'ESC'))
-                i += 3
+                # Consume the whole CSI sequence, up to its final byte. Taking
+                # a fixed three characters meant every parameterised sequence
+                # spilled its parameters into the stream as ordinary keys:
+                # shift+Up arrived as ESC ; 2 A and that bare '2' switched the
+                # palette, a mouse click emitted 2, 3 and 4, and a bracketed
+                # paste emitted '0', which reset the view. Harmless while the
+                # arrows were a secondary control; not once they steer.
+                j = i + 2
+                while j < len(s) and not ('\x40' <= s[j] <= '\x7e'):
+                    j += 1
+                if j >= len(s):         # split read: leave it for the next poll
+                    break
+                # An unrecognised CSI is swallowed, not reported as ESC. ESC
+                # ascends the tree, and no terminal sends a parameterised
+                # sequence to mean the user pressed Escape -- only a bare \x1b
+                # does, which the branch below still handles.
+                if j == i + 2 and s[j] in arrows:
+                    out.append(arrows[s[j]])
+                i = j + 1
             elif s[i] == '\x7f' or s[i] == '\x08':
                 out.append('BKSP')
                 i += 1
@@ -653,6 +720,39 @@ ROT_RATE = 0.30     # radians/second of orbit at --speed 1
 FIT_RING = [(math.cos(i * math.pi / 12), math.sin(i * math.pi / 12))
             for i in range(24)]
 
+# --- street level ---------------------------------------------------------
+# Human scale is fixed from the eye, not from the buildings: a 1.7 m eye at
+# EYE_H makes one world unit about 3.4 m, which puts the median block at ~36 m
+# (twelve storeys), the tallest at ~220 m, and the streets between them at
+# 1.5-3 m. A dense downtown of alleys, which is the right look for this.
+EYE_H = 0.5
+WALK_R = 0.30       # collision radius, about a metre
+WALK_V = 4.0        # world units per second on foot, ~14 m/s
+WALK_TURN = 0.10    # radians per turn keypress; autorepeat does the rest
+WALK_TAU = 0.18     # velocity decay; see the note on key repeat in walk_step
+FP_FOV = math.radians(65.0)     # vertical field of view
+
+# The orbit camera sits 210 units out from a 100-unit plot, so no geometry ever
+# comes near it and clamping the divisor is enough. Standing in a street, walls
+# cross the eye plane constantly, so there is a real near plane now. It has to
+# be clipped against, not clamped to -- clamping does not only fold a straddling
+# wall inside out, it also freezes the size of a wall you are walking toward.
+# ZNEAR sits well inside WALK_R so a whole face is never nearer than this; what
+# crosses the plane is the far side of a face that extends past your shoulder.
+ZNEAR = 0.08
+
+# Street level relays the city out with wider streets and no slivers. This is
+# not decoration: the orbit layout leaves 93 of 238 gaps narrower than twice
+# the walker, and a walker wedged in a gap it does not fit has *no* legal
+# position -- pushing it off one wall pushes it into the other, for ever.
+# Measured over half a million substeps, the shipped layout leaves the walker
+# up to 0.10 units inside a building and no number of resolution passes fixes
+# it (16 passes still left 0.047); these numbers leave exactly zero. Shrinking
+# the walker instead does not work either -- at radius 0.14 it is still 0.04
+# inside, because the layout emits blocks as thin as 0.04 whatever you do.
+WALK_STREET = 0.50
+WALK_MINPLOT = 4.0
+
 
 class Bldg:
     __slots__ = ('node', 'x0', 'y0', 'x1', 'y1', 'h', 'cat', 'root', 'level')
@@ -675,7 +775,8 @@ def weight_of(node, mode):
     return w ** 0.55 if w > 0 else 0.0
 
 
-def layout(cur, levels, footprint, height_mode, budget=520, min_plot=MIN_PLOT):
+def layout(cur, levels, footprint, height_mode, budget=520, min_plot=MIN_PLOT,
+           street=STREET):
     """Lay the current directory out as a city. Returns (buildings, districts)
     where districts are the (node, rect) of the direct children — the things
     the selection cursor moves between."""
@@ -750,20 +851,20 @@ def layout(cur, levels, footprint, height_mode, budget=520, min_plot=MIN_PLOT):
         if w <= 0 or h <= 0:
             continue
         cat = n.top_cat()
-        mx = min(min(w, h) * STREET, 1.2)
+        mx = min(min(w, h) * street, 1.2)
         x0, y0, x1, y1 = x + mx, y + mx, x + w - mx, y + h - mx
         if x1 - x0 < 0.05 or y1 - y0 < 0.05:
             continue
         if i in subdivide:
             _sub(out, n, x0, y0, x1 - x0, y1 - y0, height, footprint, n, 2,
-                 levels, budget, min_plot)
+                 levels, budget, min_plot, street)
         else:
             out.append(Bldg(n, x0, y0, x1, y1, height(n.size), cat, n, 1))
     return out, districts
 
 
 def _sub(out, node, x, y, w, h, height, footprint, root, level, levels, budget,
-         min_plot):
+         min_plot, street=STREET):
     kids = [c for c in node.children if c.size > 0 or c.files > 0][:24]
     if not kids or level > levels:
         out.append(Bldg(node, x, y, x + w, y + h, height(node.size),
@@ -776,7 +877,7 @@ def _sub(out, node, x, y, w, h, height, footprint, root, level, levels, budget,
     for n, (rx, ry, rw, rh) in zip(kids, rects):
         if rw <= 0 or rh <= 0:
             continue
-        mx = min(min(rw, rh) * STREET, 0.45)
+        mx = min(min(rw, rh) * street, 0.45)
         a, b, c, d = rx + mx, ry + mx, rx + rw - mx, ry + rh - mx
         if c - a < 0.04 or d - b < 0.04:
             continue
@@ -786,7 +887,7 @@ def _sub(out, node, x, y, w, h, height, footprint, root, level, levels, budget,
         if (level < levels and len(n.children) >= 2 and len(out) < budget
                 and min(c - a, d - b) >= min_plot * 2):
             _sub(out, n, a, b, c - a, d - b, height, footprint, root,
-                 level + 1, levels, budget, min_plot)
+                 level + 1, levels, budget, min_plot, street)
         else:
             out.append(Bldg(n, a, b, c, d, height(n.size), n.top_cat(),
                             root, level))
@@ -863,6 +964,69 @@ def bsp_order(tree, camx, camy):
     return out
 
 
+# --- near-plane clipping --------------------------------------------------
+# Sutherland-Hodgman against the single plane zv = ZNEAR, run on the camera
+# -space triples *before* the perspective divide. All three components are
+# linear in world position, so interpolating the crossing point linearly is
+# exact rather than approximate -- which is the whole reason for clipping here
+# rather than after the divide, where nothing is linear any more.
+def clip_near(cp):
+    """cp = [(u, v, zv), ...] convex. Returns [] or a 3-to-5 point polygon."""
+    for p in cp:
+        if p[2] < ZNEAR:
+            break
+    else:
+        return cp                       # wholly in front, the common case
+    out = []
+    n = len(cp)
+    for i in range(n):
+        a, b = cp[i], cp[i - 1]
+        ain, bin_ = a[2] >= ZNEAR, b[2] >= ZNEAR
+        if ain != bin_:
+            t = (ZNEAR - b[2]) / (a[2] - b[2])
+            out.append((b[0] + (a[0] - b[0]) * t,
+                        b[1] + (a[1] - b[1]) * t, ZNEAR))
+        if ain:
+            out.append(a)
+    return out
+
+
+def clip_seg(a, b):
+    """Same plane, for a segment. Returns (a, b) or None if wholly behind."""
+    if a[2] >= ZNEAR and b[2] >= ZNEAR:
+        return a, b
+    if a[2] < ZNEAR and b[2] < ZNEAR:
+        return None
+    t = (ZNEAR - b[2]) / (a[2] - b[2])
+    m = (b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t, ZNEAR)
+    return (a, m) if a[2] >= ZNEAR else (m, b)
+
+
+def ray_block(b, ox, oy, oz, dx, dy, dz):
+    """Slab method. Distance to the near face of b, or None if the ray misses.
+
+    The same test the ray-cast harness used to prove the painter's order; here
+    it answers what the crosshair is pointing at.
+    """
+    t0, t1 = 0.0, 1e30
+    for o, d, lo, hi in ((ox, dx, b.x0, b.x1), (oy, dy, b.y0, b.y1),
+                         (oz, dz, 0.0, b.h)):
+        if -1e-12 < d < 1e-12:
+            if o < lo or o > hi:
+                return None
+        else:
+            ta, tb = (lo - o) / d, (hi - o) / d
+            if ta > tb:
+                ta, tb = tb, ta
+            if ta > t0:
+                t0 = ta
+            if tb < t1:
+                t1 = tb
+            if t0 > t1:
+                return None
+    return t0 if t0 > 0.0 else (t1 if t1 > 0.0 else None)
+
+
 # --- report mode ----------------------------------------------------------
 def populate_files(fn, apparent):
     """Fill a loose-files district with one node per real file. Done on demand
@@ -890,6 +1054,20 @@ def populate_files(fn, apparent):
         pass
     fn.children = kids
     return kids
+
+
+def enterable(n):
+    """Is there a city to draw inside `n`? `children` alone is the wrong test:
+    it holds subdirectories only, so a directory of nothing but files looked
+    like a leaf even though layout() gives its loose bytes a district of their
+    own -- which for a folder of 47 GB of models is the whole point of going in.
+    Mirrors layout()'s own kids test, so the two cannot disagree."""
+    if n.isfiles:
+        return True                 # populate_files decides; it may find none
+    if any(c.size > 0 or c.files > 0 for c in n.children):
+        return True
+    return (n.size - sum(c.size for c in n.children) > 0
+            or n.files - sum(c.files for c in n.children) > 0)
 
 
 def print_report(sc, limit=40):
@@ -941,6 +1119,38 @@ HELP_LINES = [
     'p      cycle palette',
     '1-5    palette direct',
     'z      zen mode',
+    'W      street level',
+    'h / ?  close help',
+]
+
+# Street level rebinds w/a/s/d, so it needs its own list rather than a single
+# one grown to cover both. Keys not named here are silently inert while it
+# holds -- nobody needs to be told off by their own skyline.
+WALK_HELP_LINES = [
+    'W      back to orbit',
+    'q      quit',
+    'w / s  forward / back',
+    'a / d  strafe',
+    '<- ->  turn',
+    '^  v   look up / down',
+    '[  ]   field of view',
+    ',  .   walk slower /',
+    '       faster',
+    'ENTER  enter the',
+    '       building ahead',
+    'x      mark it',
+    'BKSP   ascend',
+    'j / k  select district',
+    '       (the beam)',
+    'r      rescan subtree',
+    'b      biggest files',
+    'l      district labels',
+    'g      ground grid',
+    'f      footprint metric',
+    'p      cycle palette',
+    '1-5    palette direct',
+    'z      zen mode',
+    '0      reset to orbit',
     'h / ?  close help',
 ]
 
@@ -1038,7 +1248,14 @@ def main():
     dist_cam = 210.0        # pulled back in plan view, toward orthographic
     dist_target = 210.0
     plan = False            # top-down plan view (t)
-    plan_restore = (el, False)
+    plan_restore = el       # only the tilt: the rest of the set is fixed
+    walk = False            # street level (W)
+    wx, wy = 0.0, 0.0       # walker's feet; eye is EYE_H above them
+    wv_f = wv_s = 0.0       # forward/strafe velocity, decayed each frame
+    walk_near = None        # blocks close enough to collide with
+    walk_anchor = None      # where walk_near was gathered from
+    walk_target = None      # the block under the crosshair
+    walk_restore = None     # the whole orbit variable set, put back by W
     zoom = 1.0
     speed = args.speed
     paused = False
@@ -1083,9 +1300,14 @@ def main():
         # buys nothing, and a small terminal turns into mud.
         min_plot = max(0.5, min(6.0, 500.0 / (cols * SUBX * 0.75)))
         budget = max(250, min(1400, cols * rows // 20))
+        street = STREET
+        if walk:
+            # Wider streets and no slivers, so the walker always has somewhere
+            # legal to stand. See WALK_STREET for why this is not optional.
+            min_plot, street = WALK_MINPLOT, WALK_STREET
         with sc.lock:
             blds, districts = layout(stack[-1], levels, footprint,
-                                     args.height, budget, min_plot)
+                                     args.height, budget, min_plot, street)
         bsp = build_bsp(blds)
         # Districts are re-sorted by size every time the scan moves, so a bare
         # row index would slide onto a different directory under the cursor.
@@ -1104,6 +1326,142 @@ def main():
         if sel >= len(districts):
             sel = max(0, len(districts) - 1)
         sel_node = districts[sel][0] if districts else None
+        # The layout is rebuilt every 0.45 s while the scan runs, and on every
+        # descend and ascend, so a building can materialise around the walker.
+        # Inside a footprint both wall tests pick None and the block draws
+        # nothing, so you would be standing in an invisible building -- push
+        # back out before anyone sees it.
+        if walk:
+            walk_gather()
+            for _ in range(8):
+                if not walk_resolve():
+                    break
+            else:
+                walk_spawn()        # wedged: start again from the street
+
+    # --- walking --------------------------------------------------------
+    # Every block stands at least 0.55 units tall and the eye is at 0.5, so
+    # there is nothing to step over and no height test to make: a footprint is
+    # simply solid. That also keeps the renderer honest -- inside a footprint
+    # both wall tests pick None and the block draws nothing, so the camera
+    # being outside every footprint is what makes the cheap backface test
+    # correct, and collision is what guarantees it.
+    def walk_gather():
+        """Blocks near enough to matter. Refreshed on movement, not per frame."""
+        nonlocal walk_near, walk_anchor
+        r = 8.0
+        walk_near = [b for b in blds
+                     if b.x0 - r < wx < b.x1 + r and b.y0 - r < wy < b.y1 + r]
+        walk_anchor = (wx, wy)
+
+    def walk_resolve():
+        """Push the walker out of any block it overlaps. True if it moved."""
+        nonlocal wx, wy
+        moved = False
+        for _pass in (0, 1):        # twice, so an inside corner settles
+            for b in walk_near:
+                cx = b.x0 if wx < b.x0 else (b.x1 if wx > b.x1 else wx)
+                cy = b.y0 if wy < b.y0 else (b.y1 if wy > b.y1 else wy)
+                dx, dy = wx - cx, wy - cy
+                d2 = dx * dx + dy * dy
+                if d2 >= WALK_R * WALK_R:
+                    continue
+                moved = True
+                if d2 > 1e-12:
+                    d = math.sqrt(d2)
+                    k = (WALK_R - d) / d
+                    wx += dx * k
+                    wy += dy * k
+                else:
+                    # dead centre inside: leave by the nearest wall
+                    out = min((wx - b.x0, -1.0, 0.0), (b.x1 - wx, 1.0, 0.0),
+                              (wy - b.y0, 0.0, -1.0), (b.y1 - wy, 0.0, 1.0))
+                    wx += out[1] * (out[0] + WALK_R)
+                    wy += out[2] * (out[0] + WALK_R)
+        g = PLOT / 2 - WALK_R
+        wx = max(-g, min(g, wx))
+        wy = max(-g, min(g, wy))
+        return moved
+
+    def walk_clear(px, py):
+        """Distance from (px, py) to the nearest block, negative if inside.
+
+        The plot edge counts as a wall. It is not one you can bump into, but
+        beyond it there is nothing to see, so treating open ground as elbow
+        room sent the spawn straight out to the perimeter every time.
+        """
+        g = PLOT / 2
+        best = min(g - px, px + g, g - py, py + g)
+        if best < 0.0:
+            return -1.0
+        for b in blds:
+            cx = b.x0 if px < b.x0 else (b.x1 if px > b.x1 else px)
+            cy = b.y0 if py < b.y0 else (b.y1 if py > b.y1 else py)
+            if cx == px and cy == py:
+                return -1.0
+            d = math.hypot(px - cx, py - cy)
+            if d < best:
+                best = d
+        return best
+
+    def walk_spawn():
+        """Put the walker on the street outside whatever district is selected,
+        so W means 'go and stand next to the thing I was looking at'."""
+        nonlocal wx, wy, az
+        if districts and 0 <= sel < len(districts):
+            _, (rx, ry, rw, rh) = districts[sel]
+            tx, ty = rx + rw / 2, ry + rh / 2
+        else:
+            tx = ty = 0.0
+        # Nearest is the wrong thing to want. The closest point that merely
+        # clears the walker is the tightest crack against the district wall,
+        # and standing in a 0.6-unit slot between ten-unit blocks means the
+        # whole screen is one wall. Score elbow room against distance instead
+        # and you come out on the widest street nearby, facing in.
+        g = PLOT / 2 - WALK_R
+        best, bests = None, -1e30
+        for ring in range(1, 34):
+            r = ring * 0.7
+            steps = max(10, ring * 5)
+            for i in range(steps):
+                a = i * 2 * math.pi / steps
+                px, py = tx + r * math.cos(a), ty + r * math.sin(a)
+                if not (-g <= px <= g and -g <= py <= g):
+                    continue
+                cl = walk_clear(px, py)
+                if cl < WALK_R:
+                    continue
+                # room is worth having, but only up to a point: past a couple
+                # of units it is a plaza and further out buys nothing
+                s = min(cl, 2.0) * 3.0 - r * 0.28
+                if s > bests:
+                    best, bests = (px, py), s
+            if best is not None and ring * 0.7 > 14.0:
+                break               # far enough that nothing better is coming
+        wx, wy = best if best is not None else (0.0, 0.0)
+        # Facing the district you asked for sounds right and looks terrible:
+        # you are standing a metre from it, so its nearest wall is the whole
+        # screen. Look down the street instead, preferring the open direction
+        # that also points roughly at the selection -- you get a view, and the
+        # compass and the beam still say where the thing is.
+        # The camera's forward vector is (-sin az, cos az).
+        want = math.atan2(-(tx - wx), ty - wy)
+        best_a, best_s = want, -1e30
+        for i in range(24):
+            a = i * math.pi / 12
+            dx_, dy_ = -math.sin(a), math.cos(a)
+            reach = 60.0
+            for b in blds:
+                t = ray_block(b, wx, wy, EYE_H, dx_, dy_, 0.0)
+                if t is not None and t < reach:
+                    reach = t
+            d = (a - want + math.pi) % (2 * math.pi) - math.pi
+            s = min(reach, 26.0) + 7.0 * math.cos(d)
+            if s > best_s:
+                best_a, best_s = a, s
+        az = best_a
+        walk_gather()
+        walk_resolve()
 
     def start_scan(path, select_name=None):
         """Throw the tree away and walk somewhere else. Used by `r`, and by
@@ -1159,17 +1517,25 @@ def main():
                     # of the ease that holds the plan's heading square; the two
                     # fought and settled at a skewed offset, which from
                     # overhead read as the whole plan drifting off true.
-                    if not plan:
+                    # Nothing orbits at street level either, so the same holds.
+                    if not (plan or walk):
                         paused = not paused
                         flash, flash_until = ('PAUSED' if paused else 'ORBIT',
                                               now + 0.8)
                 elif k == 'LEFT':
-                    if az_target is None:
+                    if walk:
+                        # Screen-right sits at bearing az - theta (xr rotates
+                        # the world by -az), so az counts anticlockwise and
+                        # turning left *adds*. Fixed step per press, like orbit.
+                        az += WALK_TURN
+                    elif az_target is None:
                         az -= 0.12
                     else:
                         az_target -= math.pi / 2   # quarter-turn the plan
                 elif k == 'RIGHT':
-                    if az_target is None:
+                    if walk:
+                        az -= WALK_TURN
+                    elif az_target is None:
                         az += 0.12
                     else:
                         az_target += math.pi / 2
@@ -1179,12 +1545,65 @@ def main():
                     # heading, the pulled-back camera and the pause behind it,
                     # which is neither a plan nor an orbit. `t` is the only way
                     # out, so every exit restores the whole set together.
-                    if plan:
+                    if walk:
+                        # el is the camera's own pitch, so positive is looking
+                        # down: the same variable, reused rather than doubled.
+                        lim = math.radians(60)
+                        if k == 'UP':
+                            el_target = max(-lim, el_target - 0.06)
+                        else:
+                            el_target = min(lim, el_target + 0.06)
+                    elif plan:
                         pass
                     elif k == 'UP':
                         el_target = min(math.radians(80), el_target + 0.05)
                     else:
                         el_target = max(math.radians(5), el_target - 0.05)
+                elif k in ('w', 'a', 's', 'd') and walk:
+                    # Movement while walking. `w` and `s` are the window and
+                    # star toggles in orbit; the mode owns the keymap while it
+                    # holds, and W puts the whole set back on the way out.
+                    v = WALK_V * speed
+                    if k == 'w':
+                        wv_f = v
+                    elif k == 's':
+                        wv_f = -v
+                    elif k == 'a':
+                        wv_s = -v
+                    else:
+                        wv_s = v
+                elif k == 'W':
+                    # The single entry and the single exit. Walk and plan view
+                    # are mutually exclusive, and neither reaches into the
+                    # other: W is silently inert while the plan is up.
+                    if walk:
+                        (el_target, az_target, dist_target, paused, zoom,
+                         speed) = walk_restore
+                        walk = False
+                        wv_f = wv_s = 0.0
+                        walk_target = None
+                        # re-seed the orbit fit rather than easing up from the
+                        # street focal length, which would swim into place
+                        fit_f = None
+                        layout_sig = None       # orbit streets back
+                        flash, flash_until = 'ORBIT', now + 0.9
+                    elif not plan:
+                        walk_restore = (el_target, az_target, dist_target,
+                                        paused, zoom, speed)
+                        walk = True
+                        el = el_target = 0.0
+                        az_target, paused = None, True
+                        zoom, speed = 1.0, 1.0
+                        wv_f = wv_s = 0.0
+                        fit_f = None
+                        # the walk layout has to exist before the spawn looks
+                        # for somewhere to stand in it
+                        relayout()
+                        layout_sig = None
+                        walk_spawn()
+                        flash, flash_until = 'STREET LEVEL', now + 1.2
+                elif k == 't' and walk:
+                    pass        # plan and street level are mutually exclusive
                 elif k == 't':
                     plan = not plan
                     if plan:
@@ -1209,11 +1628,19 @@ def main():
                 elif k == '[':
                     zoom = max(0.4, zoom / 1.12)
                 elif k in ('.', '>'):
-                    speed = min(8.0, speed + 0.25)
-                    flash, flash_until = f'SPIN {speed:+.2f}x', now + 0.8
+                    if walk:
+                        speed = min(3.0, speed + 0.25)
+                        flash, flash_until = f'PACE {speed:.2f}x', now + 0.8
+                    else:
+                        speed = min(8.0, speed + 0.25)
+                        flash, flash_until = f'SPIN {speed:+.2f}x', now + 0.8
                 elif k in (',', '<'):
-                    speed = max(-8.0, speed - 0.25)   # through zero into reverse
-                    flash, flash_until = f'SPIN {speed:+.2f}x', now + 0.8
+                    if walk:
+                        speed = max(0.4, speed - 0.25)
+                        flash, flash_until = f'PACE {speed:.2f}x', now + 0.8
+                    else:
+                        speed = max(-8.0, speed - 0.25)  # through zero, reverse
+                        flash, flash_until = f'SPIN {speed:+.2f}x', now + 0.8
                 elif k in ('j', '\t'):
                     if districts:
                         set_sel((sel + 1) % len(districts))
@@ -1221,11 +1648,20 @@ def main():
                     if districts:
                         set_sel((sel - 1) % len(districts))
                 elif k == 'ENTER':
-                    if districts and sel < len(districts):
+                    # From the street you step into the building you are facing;
+                    # from orbit you descend into the district under the cursor.
+                    n = None
+                    if walk:
+                        if walk_target is not None:
+                            n = walk_target.node
+                        else:
+                            flash, flash_until = 'NOTHING AHEAD', now + 0.9
+                    elif districts and sel < len(districts):
                         n = districts[sel][0]
+                    if n is not None:
                         if n.isfiles and not n.children:
                             populate_files(n, args.apparent_size)
-                        if n.children:
+                        if enterable(n) and (n.children or not n.isfiles):
                             stack.append(n)
                             sel, sel_node = 0, None
                             layout_sig = None
@@ -1233,7 +1669,7 @@ def main():
                         elif n.isfiles:
                             flash, flash_until = 'NO READABLE FILES HERE', now + 1.0
                         else:
-                            flash, flash_until = 'LEAF — no subdirectories', now + 1.0
+                            flash, flash_until = 'EMPTY — nothing to show', now + 1.0
                 elif k in ('BKSP', 'ESC'):
                     if len(stack) > 1:
                         child = stack.pop()
@@ -1284,8 +1720,18 @@ def main():
                     layout_sig = None
                     flash, flash_until = 'FOOTPRINT = ' + footprint.upper(), now + 1.0
                 elif k == 'x':
-                    if districts and sel < len(districts):
+                    # Marks the building you are facing at street level, the
+                    # district under the cursor from orbit. Either way it only
+                    # ever *marks*: the paths print on exit, nothing is touched.
+                    n = None
+                    if walk:
+                        if walk_target is not None:
+                            n = walk_target.node
+                        else:
+                            flash, flash_until = 'NOTHING AHEAD', now + 0.9
+                    elif districts and sel < len(districts):
                         n = districts[sel][0]
+                    if n is not None:
                         p = n.path()
                         if n.isfiles:
                             # its path is the directory itself, so marking it
@@ -1307,9 +1753,21 @@ def main():
                 elif k in ('h', '?'):
                     show_help = not show_help
                 elif k == '0':
+                    # The panic key, so it has to restore the *whole* camera
+                    # variable set. It used to clear `plan` and leave `paused`
+                    # behind, so t then 0 gave you a frozen orbit -- the same
+                    # neither-one-mode-nor-the-other state the tilt keys used
+                    # to produce. A partial reset is worse than none.
                     az, zoom, speed = 0.7, 1.0, args.speed
                     el_target, plan = math.radians(22), False
                     az_target, dist_target = None, 210.0
+                    paused = False
+                    if walk:
+                        walk = False
+                        wv_f = wv_s = 0.0
+                        walk_target = None
+                        fit_f = None
+                        layout_sig = None
 
             # ---- layout (cheap to skip; the tree only grows) ----
             sig = (id(cur), footprint, levels, len(cur.children), cur.size >> 22)
@@ -1322,6 +1780,35 @@ def main():
                 # per second, not per frame: otherwise --fps silently doubles
                 # the rotation rate and the orbit stutters when the scan is busy
                 az += ROT_RATE * speed * dt_frame
+            if walk:
+                # A terminal reports key presses, never releases, so there is
+                # no such thing as a key being "held" here. Each press instead
+                # tops the velocity up and it decays with a short time
+                # constant: under the ~30/s autorepeat that arrives while a key
+                # really is held, the top-ups outrun the decay and the walk is
+                # smooth; let go and it coasts to a stop in about half a
+                # second. Decay is per second, like everything else, so --fps
+                # cannot change how fast you walk.
+                k_decay = math.exp(-dt_frame / WALK_TAU)
+                step_f, step_s = wv_f * dt_frame, wv_s * dt_frame
+                wv_f *= k_decay
+                wv_s *= k_decay
+                if step_f or step_s:
+                    # forward is (-sa, ca), right is (ca, sa)
+                    ca_, sa_ = math.cos(az), math.sin(az)
+                    mx = -step_f * sa_ + step_s * ca_
+                    my = step_f * ca_ + step_s * sa_
+                    # Substep: the layout still leaves blocks as thin as 0.04
+                    # units, and a single frame's move can be longer than that,
+                    # so a one-shot test would let you walk through a wall.
+                    n_sub = int(math.hypot(mx, my) / (WALK_R * 0.5)) + 1
+                    for _s in range(n_sub):
+                        wx += mx / n_sub
+                        wy += my / n_sub
+                        walk_resolve()
+                    if walk_anchor is None or math.hypot(
+                            wx - walk_anchor[0], wy - walk_anchor[1]) > 2.0:
+                        walk_gather()
             # ease tilt, plan-view heading and camera distance, so t reads as
             # the camera craning overhead rather than cutting to a new shot
             k_ease = min(1.0, dt_frame * 5.0)
@@ -1346,50 +1833,76 @@ def main():
             panel = 0 if zen else min(38, max(20, cols // 3))
             panel = min(panel, max(12, cols - 22))
             hmx = max((b.h for b in blds), default=HMAX * 0.5)
-
-            # Fit the CYLINDER that circumscribes the plot, not the plot's own
-            # corners. Fitting the corners meant the frame tracked the
-            # silhouette of a rotating square, which is 41% wider corner-on
-            # than edge-on: the city pulled away as a corner came round and
-            # crept back in on the flats, a 17% breathing every quarter turn.
-            # A circle centred on the plot is rotationally symmetric, so its
-            # projection does not depend on the azimuth at all — substituting
-            # th = phi - az below leaves no `az` term — and the framing is
-            # therefore exactly constant as the camera orbits.
-            rad = PLOT * 0.7071067811865476        # (PLOT/2) * sqrt(2)
-            us, vs = [], []
-            for cth, sth in FIT_RING:
-                xr, yr = rad * cth, rad * sth
-                for cz_ in (0.0, hmx):
-                    zv = yr * ce - cz_ * se + DIST
-                    if zv < 1.0:
-                        zv = 1.0
-                    # x is scaled by SUBX: a quadrant sub-cell is half as wide
-                    # as it is tall, so equal world lengths need SUBX times as
-                    # many horizontal pixels as vertical ones to stay square.
-                    us.append(SUBX * xr / zv)
-                    vs.append(-(yr * se + cz_ * ce) / zv)
-            du = (max(us) - min(us)) or 1e-6
-            dv = (max(vs) - min(vs)) or 1e-6
             panel_px = panel * SUBX
             avail_w = pxw - panel_px - 2
-            # A constant fit has to be the safe one, so the framing now sits
-            # where the corner-on framing used to — the loosest point of the
-            # old swing. The margin was 0.94 to leave room for that swing;
-            # with nothing left to swing, some of it can go back to the city.
-            want = min(avail_w / du, (pxh - 4) / dv) * 0.97 * zoom
-            ox = panel_px + avail_w / 2 - want * (min(us) + max(us)) / 2
-            oy = pxh / 2 - want * (min(vs) + max(vs)) / 2
-            if fit_f is None:
-                fit_f, fit_ox, fit_oy = want, ox, oy
-            else:   # low-pass so rotation doesn't make the frame breathe
-                a = 0.18
-                fit_f += (want - fit_f) * a
-                fit_ox += (ox - fit_ox) * a
-                fit_oy += (oy - fit_oy) * a
-            F, OX, OY = fit_f, fit_ox, fit_oy
 
-            def proj(x, y, z):
+            if walk:
+                # Framing the whole city is meaningless from inside it: the
+                # eye is the frame. A fixed focal length from a fixed field of
+                # view, and deliberately no low-pass — an eased F while you
+                # turn would feel like a rubber lens.
+                camX, camY, camZ = wx, wy, EYE_H
+                fov = max(0.35, min(1.6, FP_FOV / zoom))
+                F = (pxh / 2) / math.tan(fov / 2)
+                OX = panel_px + avail_w / 2
+                OY = pxh / 2
+                # Make the orbit fit re-seed rather than ease up from the
+                # street focal length when W hands the camera back.
+                fit_f = None
+                fog_near, fog_far = 12.0, 70.0
+            else:
+                # Fit the CYLINDER that circumscribes the plot, not the plot's
+                # own corners. Fitting the corners meant the frame tracked the
+                # silhouette of a rotating square, which is 41% wider corner-on
+                # than edge-on: the city pulled away as a corner came round and
+                # crept back in on the flats, a 17% breathing every quarter
+                # turn. A circle centred on the plot is rotationally symmetric,
+                # so its projection does not depend on the azimuth at all —
+                # substituting th = phi - az below leaves no `az` term — and the
+                # framing is therefore exactly constant as the camera orbits.
+                rad = PLOT * 0.7071067811865476        # (PLOT/2) * sqrt(2)
+                us, vs = [], []
+                for cth, sth in FIT_RING:
+                    xr, yr = rad * cth, rad * sth
+                    for cz_ in (0.0, hmx):
+                        zv = yr * ce - cz_ * se + DIST
+                        if zv < 1.0:
+                            zv = 1.0
+                        # x is scaled by SUBX: a quadrant sub-cell is half as
+                        # wide as it is tall, so equal world lengths need SUBX
+                        # times as many horizontal pixels as vertical ones.
+                        us.append(SUBX * xr / zv)
+                        vs.append(-(yr * se + cz_ * ce) / zv)
+                du = (max(us) - min(us)) or 1e-6
+                dv = (max(vs) - min(vs)) or 1e-6
+                # A constant fit has to be the safe one, so the framing now sits
+                # where the corner-on framing used to — the loosest point of the
+                # old swing. The margin was 0.94 to leave room for that swing;
+                # with nothing left to swing, some of it can go back to the city.
+                want = min(avail_w / du, (pxh - 4) / dv) * 0.97 * zoom
+                ox = panel_px + avail_w / 2 - want * (min(us) + max(us)) / 2
+                oy = pxh / 2 - want * (min(vs) + max(vs)) / 2
+                if fit_f is None:
+                    fit_f, fit_ox, fit_oy = want, ox, oy
+                else:   # low-pass so rotation doesn't make the frame breathe
+                    a = 0.18
+                    fit_f += (want - fit_f) * a
+                    fit_ox += (ox - fit_ox) * a
+                    fit_oy += (oy - fit_oy) * a
+                F, OX, OY = fit_f, fit_ox, fit_oy
+                camX = DIST * ce * sa
+                camY = -DIST * ce * ca
+                camZ = DIST * se
+                fog_near, fog_far = DIST - 80, DIST + 90
+
+            # The orbit projection, kept verbatim. The free-camera form below is
+            # its algebraic superset — substituting the orbit's own camera
+            # position into it gives back exactly this — but "algebraically
+            # identical" is not "bit-identical": subtracting the eye first
+            # reassociates the sums and moves the odd result by an ULP, which is
+            # enough to flip an int(ceil(...)) and shift a pixel. Orbit renders
+            # are the regression gate here, so orbit keeps its own arithmetic.
+            def proj_orbit(x, y, z):
                 xr = x * ca + y * sa
                 yr = -x * sa + y * ca
                 zv = yr * ce - z * se + DIST
@@ -1397,6 +1910,69 @@ def main():
                     zv = 1.0
                 return (OX + F * SUBX * xr / zv,
                         OY - F * (yr * se + z * ce) / zv, zv)
+
+            def view(x, y, z):
+                """World -> camera space (right, up, forward), before the divide.
+
+                All three are linear in (x, y, z), which is what lets clip_near
+                interpolate a crossing point exactly.
+                """
+                dx, dy, dz = x - camX, y - camY, z - camZ
+                xr = dx * ca + dy * sa
+                yr = -dx * sa + dy * ca
+                return (xr, -(yr * se + dz * ce), yr * ce - dz * se)
+
+            def toscreen(p):
+                zv = p[2]
+                return (OX + F * SUBX * p[0] / zv, OY + F * p[1] / zv, zv)
+
+            def proj_fp(x, y, z):
+                # No near clamp: callers clip, and clamping would be a bug of
+                # its own here — a wall 0.3 units from your face would stop
+                # growing as you walked into it. The 1e-9 floor is only there so
+                # a point landing exactly on the eye cannot raise; an ambient
+                # animation must not be able to traceback over a raw terminal.
+                p = view(x, y, z)
+                zv = p[2] if abs(p[2]) > 1e-9 else 1e-9
+                return (OX + F * SUBX * p[0] / zv, OY + F * p[1] / zv, zv)
+
+            proj = proj_fp if walk else proj_orbit
+
+            # A face whose corners all sit in front of the near plane needs no
+            # clipping; one that straddles it is clipped, and then two things
+            # stop being true of it. Its vertices are flung out to ~1e5 px, so
+            # `fill` has to be told the real screen extent to run its gradient
+            # over or the whole visible wall lands in one slice of the ramp and
+            # renders flat. And its corners no longer correspond to the face's
+            # own, so the window lattice cannot interpolate between them.
+            def face(wpts, ca_, cb_):
+                """Draw a world-space quad, clipped. Returns (screen_pts,
+                was_clipped); screen_pts is None if it was clipped or dropped."""
+                cp = [view(*w) for w in wpts]
+                cl = clip_near(cp)
+                if len(cl) < 3:
+                    return None, False
+                if len(cl) == len(cp):
+                    pts = [toscreen(p) for p in cl]
+                    ras.fill([p[:2] for p in pts], cb_, ca_)
+                    return pts, False
+                lo = view((wpts[0][0] + wpts[1][0]) * 0.5,
+                          (wpts[0][1] + wpts[1][1]) * 0.5, wpts[0][2])
+                hi = view((wpts[2][0] + wpts[3][0]) * 0.5,
+                          (wpts[2][1] + wpts[3][1]) * 0.5, wpts[2][2])
+                ys = [toscreen(lo)[1] if lo[2] >= ZNEAR else pxh * 4.0,
+                      toscreen(hi)[1] if hi[2] >= ZNEAR else -pxh * 3.0]
+                ras.fill([toscreen(p)[:2] for p in cl], cb_, ca_,
+                         yref=(min(ys), max(ys)))
+                return None, True
+
+            def wline(ax, ay, az_, bx, by, bz, col):
+                """A world-space segment, near-clipped then viewport-clipped."""
+                s = clip_seg(view(ax, ay, az_), view(bx, by, bz))
+                if s is None:
+                    return
+                p, q = toscreen(s[0]), toscreen(s[1])
+                ras.line_c(p[0], p[1], q[0], q[1], col)
 
             # ---- sky ----
             sky0, sky1 = P['sky']
@@ -1413,46 +1989,155 @@ def main():
 
             # ---- ground ----
             g = PLOT / 2
-            gp = [proj(-g, -g, 0)[:2], proj(g, -g, 0)[:2],
-                  proj(g, g, 0)[:2], proj(-g, g, 0)[:2]]
-            ras.fill(gp, quant(shade(P['ground'], 1.35)), quant(P['ground']))
+            if walk:
+                # Ground out to the horizon, or standing at the plot edge and
+                # looking outward shows sky below the horizon line. The grid
+                # still stops at the plot: that is where the data is.
+                og = g * 8.0
+                gq = clip_near([view(-og, -og, 0), view(og, -og, 0),
+                                view(og, og, 0), view(-og, og, 0)])
+                if len(gq) >= 3:
+                    ras.fill([toscreen(p)[:2] for p in gq],
+                             quant(shade(P['ground'], 1.35)),
+                             quant(P['ground']), yref=(OY, pxh))
+            else:
+                gp = [proj(-g, -g, 0)[:2], proj(g, -g, 0)[:2],
+                      proj(g, g, 0)[:2], proj(-g, g, 0)[:2]]
+                ras.fill(gp, quant(shade(P['ground'], 1.35)),
+                         quant(P['ground']))
             if grid_on:
                 gc = quant(shade(P['grid'], 0.85))
                 step = PLOT / 10
                 for i in range(11):
                     t = -g + i * step
-                    a = proj(t, -g, 0)
-                    b = proj(t, g, 0)
-                    ras.line(a[0], a[1], b[0], b[1], gc)
-                    a = proj(-g, t, 0)
-                    b = proj(g, t, 0)
-                    ras.line(a[0], a[1], b[0], b[1], gc)
+                    for pa, pb in (((t, -g), (t, g)), ((-g, t), (g, t))):
+                        if walk:
+                            s = clip_seg(view(pa[0], pa[1], 0),
+                                         view(pb[0], pb[1], 0))
+                            if s is None:
+                                continue
+                            a, b = toscreen(s[0]), toscreen(s[1])
+                            ras.line_c(a[0], a[1], b[0], b[1], gc)
+                        else:
+                            a = proj(pa[0], pa[1], 0)
+                            b = proj(pb[0], pb[1], 0)
+                            ras.line(a[0], a[1], b[0], b[1], gc)
             # survey sweep: a searchlight raking the plot while the walk runs
             if not sc.finished:
                 sweep = sim * 1.5
-                a = proj(0, 0, 0.2)
-                b = proj(math.cos(sweep) * g * 1.4, math.sin(sweep) * g * 1.4, 0.2)
-                ras.line(a[0], a[1], b[0], b[1], quant(shade(P['beam'], 0.75)))
+                bx = math.cos(sweep) * g * 1.4
+                by = math.sin(sweep) * g * 1.4
+                bc = quant(shade(P['beam'], 0.75))
+                if walk:
+                    s = clip_seg(view(0, 0, 0.2), view(bx, by, 0.2))
+                    if s is not None:
+                        a, b = toscreen(s[0]), toscreen(s[1])
+                        ras.line_c(a[0], a[1], b[0], b[1], bc)
+                else:
+                    a = proj(0, 0, 0.2)
+                    b = proj(bx, by, 0.2)
+                    ras.line(a[0], a[1], b[0], b[1], bc)
 
             # ---- buildings, painter's algorithm ----
-            # camera position in world coords: the painter's order, the
-            # backface test and the roof test are all decided against it
-            camX = DIST * ce * sa
-            camY = -DIST * ce * ca
-            camZ = DIST * se
-
             # Back to front, exactly, by walking the layout's guillotine cuts.
-            # See build_bsp: the tree is rebuilt only when the layout changes.
+            # See build_bsp: the tree is rebuilt only when the layout changes,
+            # and it is exact for any camera — including one standing inside
+            # the city, which is the whole reason street level is affordable.
             order = bsp_order(bsp, camX, camY) if bsp is not None else blds
+            if walk:
+                # What the crosshair is on. The view direction, derived the
+                # same way the projection derives it, then the slab test that
+                # the ray-cast harness used to prove the painter's order.
+                rdx, rdy, rdz = -sa * ce, ca * ce, -se
+                walk_target, bt = None, 1e30
+                for b in blds:
+                    t = ray_block(b, camX, camY, camZ, rdx, rdy, rdz)
+                    if t is not None and t < bt:
+                        walk_target, bt = b, t
+                # One selection, not two: looking at a district selects it, so
+                # the panel, the reticle and the beam all keep their meaning
+                # and j/k still work for cycling when you would rather not walk.
+                if walk_target is not None and walk_target.root is not sel_node:
+                    for i, (n, _) in enumerate(districts):
+                        if n is walk_target.root:
+                            set_sel(i)
+                            break
             pulse = 0.5 + 0.5 * math.sin(sim * 3.4)
-            win_budget = 2600
-            fog_near, fog_far = DIST - 80, DIST + 90
+            win_budget = 2600 if not walk else 4200
+            # Painter's has no occlusion culling, so from inside the city every
+            # block is drawn at close range unless it is thrown away first; the
+            # cull is what makes street level cheap. The half-angle comes from
+            # the projection rather than the field of view, so it stays right
+            # whatever the panel leaves for the city: a point lands on the right
+            # edge when F*SUBX*xr/zv = avail_w/2.
+            #
+            # The test is against the whole *box*, not the footprint. A footprint
+            # test is only right at zero pitch: looking up, a tall block's top
+            # has a larger zv than its base, so it swings toward the centre of
+            # the screen, and a block whose footprint is outside the wedge can
+            # still be plainly visible. Measured, that cost 64 wrongly dropped
+            # blocks over 408 sample views, every one of them while looking up.
+            #
+            # xr, zv and the two plane functions are all linear in world
+            # position, so the extreme value over an axis-aligned box is the
+            # value at its centre plus the extents weighted by |coefficient| --
+            # exact, and cheaper than projecting eight corners.
+            if walk:
+                # a few pixels of slack, so a block grazing the frame edge
+                # can never be lost to rounding: overdrawing a sliver is free,
+                # dropping a visible building is not
+                cull_t = (avail_w + 8.0) / (2.0 * F * SUBX)
+                # right plane: xr - t*zv > 0 is outside
+                cgA = ca + cull_t * sa * ce
+                cgB = sa - cull_t * ca * ce
+                cgC = cull_t * se
+                # left plane: -xr - t*zv > 0 is outside
+                chA = -ca + cull_t * sa * ce
+                chB = -sa - cull_t * ca * ce
+                # behind: zv < ZNEAR
+                czA, czB, czC = -sa * ce, ca * ce, -se
+                agA, agB, agC = abs(cgA), abs(cgB), abs(cgC)
+                ahA, ahB = abs(chA), abs(chB)
+                azA, azB, azC = abs(czA), abs(czB), abs(czC)
 
             for b in order:
                 x0, y0, x1, y1, h = b.x0, b.y0, b.x1, b.y1, b.h
-                # fog only, so the footprint centre is the right depth here
-                depth = ((-(x0 + x1) * 0.5 * sa + (y0 + y1) * 0.5 * ca) * ce
-                         + DIST)
+                if walk:
+                    # depth to the footprint centre, from the eye
+                    mx_, my_ = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                    ddx, ddy = mx_ - camX, my_ - camY
+                    depth = math.sqrt(ddx * ddx + ddy * ddy)
+                    # Distance alone is the wrong cull. Fog only takes a
+                    # block 55% of the way to the sky, so nothing ever truly
+                    # disappears into it, and a 72-unit tower just past the fog
+                    # limit was still painting 1200 pixels when it got dropped.
+                    # Cull on apparent size instead: measured from the nearest
+                    # corner, a block under about a pixel tall cannot show.
+                    nx_ = x0 if camX < x0 else (x1 if camX > x1 else camX)
+                    ny_ = y0 if camY < y0 else (y1 if camY > y1 else camY)
+                    dnear = math.hypot(nx_ - camX, ny_ - camY)
+                    if F * h < 0.6 * dnear:
+                        continue                    # sub-pixel on screen
+                    # Cull only when the whole box is outside one plane. Asking
+                    # instead whether any corner is *inside* would be wrong:
+                    # stand close to a wide block and every corner falls outside
+                    # while the block fills the screen.
+                    ecx, ecy = (x0 + x1) * 0.5 - camX, (y0 + y1) * 0.5 - camY
+                    ecz = h * 0.5 - camZ
+                    hx, hy, hz = (x1 - x0) * 0.5, (y1 - y0) * 0.5, h * 0.5
+                    if czA * ecx + czB * ecy + czC * ecz \
+                            + azA * hx + azB * hy + azC * hz < ZNEAR:
+                        continue                    # entirely behind the eye
+                    if cgA * ecx + cgB * ecy + cgC * ecz \
+                            - (agA * hx + agB * hy + agC * hz) > 0.0:
+                        continue                    # entirely off to the right
+                    if chA * ecx + chB * ecy + cgC * ecz \
+                            - (ahA * hx + ahB * hy + agC * hz) > 0.0:
+                        continue                    # entirely off to the left
+                else:
+                    # fog only, so the footprint centre is the right depth here
+                    depth = ((-(x0 + x1) * 0.5 * sa + (y0 + y1) * 0.5 * ca) * ce
+                             + DIST)
                 is_sel = sel_node is not None and b.root is sel_node
                 base = CATC[b.cat]
                 if is_sel:
@@ -1483,72 +2168,142 @@ def main():
 
                 # side faces first, then the roof paints over them
                 if sxa is None:
-                    fx_pts = None
+                    fx_pts = fx_world = None
+                    fx_clip = False
                 else:
-                    p0 = proj(sxa, y0, 0)
-                    p1 = proj(sxa, y1, 0)
-                    p2 = proj(sxa, y1, h)
-                    p3 = proj(sxa, y0, h)
                     fa = quant(shade(base, 0.74))
                     fb = quant(shade(base, 0.44))
-                    ras.fill([p0[:2], p1[:2], p2[:2], p3[:2]], fb, fa)
-                    fx_pts = (p0, p1, p2, p3)
+                    fx_world = ((sxa, y0, 0.0), (sxa, y1, 0.0),
+                                (sxa, y1, h), (sxa, y0, h))
+                    if walk:
+                        fx_pts, fx_clip = face(fx_world, fa, fb)
+                    else:
+                        p0 = proj(sxa, y0, 0)
+                        p1 = proj(sxa, y1, 0)
+                        p2 = proj(sxa, y1, h)
+                        p3 = proj(sxa, y0, h)
+                        ras.fill([p0[:2], p1[:2], p2[:2], p3[:2]], fb, fa)
+                        fx_pts, fx_clip = (p0, p1, p2, p3), False
 
                 if sya is None:
-                    fy_pts = None
+                    fy_pts = fy_world = None
+                    fy_clip = False
                 else:
-                    q0 = proj(x0, sya, 0)
-                    q1 = proj(x1, sya, 0)
-                    q2 = proj(x1, sya, h)
-                    q3 = proj(x0, sya, h)
                     ga = quant(shade(base, 0.40))
                     gb = quant(shade(base, 0.20))
-                    ras.fill([q0[:2], q1[:2], q2[:2], q3[:2]], gb, ga)
-                    fy_pts = (q0, q1, q2, q3)
+                    fy_world = ((x0, sya, 0.0), (x1, sya, 0.0),
+                                (x1, sya, h), (x0, sya, h))
+                    if walk:
+                        fy_pts, fy_clip = face(fy_world, ga, gb)
+                    else:
+                        q0 = proj(x0, sya, 0)
+                        q1 = proj(x1, sya, 0)
+                        q2 = proj(x1, sya, h)
+                        q3 = proj(x0, sya, h)
+                        ras.fill([q0[:2], q1[:2], q2[:2], q3[:2]], gb, ga)
+                        fy_pts, fy_clip = (q0, q1, q2, q3), False
 
-                t0p = proj(x0, y0, h)
-                t1p = proj(x1, y0, h)
-                t2p = proj(x1, y1, h)
-                t3p = proj(x0, y1, h)
                 # the roof is only visible from above it; at a low tilt the
                 # camera can sit below a tall block's roofline
                 roof_vis = camZ > h
-                if roof_vis:
-                    ras.fill([t0p[:2], t1p[:2], t2p[:2], t3p[:2]], top_c,
-                             quant(shade(top_c, 0.78)))
+                ec = quant(shade(top_c, 1.5))
+                cnr = quant(shade(base, 0.16))
 
                 # Edge lighting. Without it every block melts into its
                 # neighbours and the city reads as one lump; a lit roofline and
                 # a dark vertical corner are what make the silhouette legible.
-                roof = (t0p, t1p, t2p, t3p)
-                ec = quant(shade(top_c, 1.5))
-                for i in range(4):
-                    a, bb = roof[i], roof[(i + 1) % 4]
-                    ras.line(a[0], a[1], bb[0], bb[1], ec)
-                if sxa is not None and sya is not None:
-                    cnr = quant(shade(base, 0.16))
-                    e0 = proj(sxa, sya, 0)
-                    e1 = proj(sxa, sya, h)
-                    ras.line(e0[0], e0[1], e1[0], e1[1], cnr)
+                # Only the roofline you can actually see, though: all four
+                # edges were being stroked whatever the camera did, so from
+                # below a block the two FAR rooflines were drawn straight
+                # through solid wall. Faintly visible at --tilt 6, and
+                # unmissable from the street, where no roof is ever visible.
+                if roof_vis:
+                    roof_e = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+                else:
+                    # the top edges of the walls that face us, and no others
+                    roof_e = []
+                    if sxa is not None:
+                        roof_e.append(((sxa, y0), (sxa, y1)))
+                    if sya is not None:
+                        roof_e.append(((x0, sya), (x1, sya)))
+
+                if walk:
+                    if roof_vis:
+                        cq = clip_near([view(x0, y0, h), view(x1, y0, h),
+                                        view(x1, y1, h), view(x0, y1, h)])
+                        if len(cq) >= 3:
+                            ras.fill([toscreen(p)[:2] for p in cq], top_c,
+                                     quant(shade(top_c, 0.78)))
+                        for i in range(4):
+                            a_, bb_ = roof_e[i], roof_e[(i + 1) % 4]
+                            wline(a_[0], a_[1], h, bb_[0], bb_[1], h, ec)
+                    else:
+                        for a_, bb_ in roof_e:
+                            wline(a_[0], a_[1], h, bb_[0], bb_[1], h, ec)
+                    if sxa is not None and sya is not None:
+                        wline(sxa, sya, 0.0, sxa, sya, h, cnr)
+                else:
+                    t0p = proj(x0, y0, h)
+                    t1p = proj(x1, y0, h)
+                    t2p = proj(x1, y1, h)
+                    t3p = proj(x0, y1, h)
+                    if roof_vis:
+                        ras.fill([t0p[:2], t1p[:2], t2p[:2], t3p[:2]], top_c,
+                                 quant(shade(top_c, 0.78)))
+                        roof = (t0p, t1p, t2p, t3p)
+                        for i in range(4):
+                            a, bb = roof[i], roof[(i + 1) % 4]
+                            ras.line(a[0], a[1], bb[0], bb[1], ec)
+                    else:
+                        for a_, bb_ in roof_e:
+                            p = proj(a_[0], a_[1], h)
+                            q = proj(bb_[0], bb_[1], h)
+                            ras.line(p[0], p[1], q[0], q[1], ec)
+                    if sxa is not None and sya is not None:
+                        e0 = proj(sxa, sya, 0)
+                        e1 = proj(sxa, sya, h)
+                        ras.line(e0[0], e0[1], e1[0], e1[1], cnr)
 
                 # ---- window lights ----
-                if windows and win_budget > 0 and h > 2.0:
+                # In walk mode the lattice is the per-pixel cost that matters,
+                # and past ~35 units a face is small and half fogged out
+                # anyway, so it buys nothing.
+                if (windows and win_budget > 0 and h > 2.0
+                        and not (walk and depth > 35.0)):
                     wc = quant(lerp(P['win'], base, 0.25 + 0.25 * fogt))
                     seed = b.node.seed
-                    for pts in (fx_pts, fy_pts):
-                        if pts is None:
+                    for pts, wpts, clipped in ((fx_pts, fx_world, fx_clip),
+                                               (fy_pts, fy_world, fy_clip)):
+                        if pts is None and not clipped:
                             continue
-                        a0, a1, a2, a3 = pts
-                        # lattice spacing comes from the face's size *on screen*,
-                        # otherwise a distant block gets a window per pixel
-                        bw = math.hypot(a1[0] - a0[0], a1[1] - a0[1])
-                        bh_ = math.hypot(a3[0] - a0[0], a3[1] - a0[1])
-                        nu = int(bw / 3.6)
-                        nv = int(bh_ / 3.0)
-                        if nu < 1 or nv < 2:
-                            continue
-                        nu = min(nu, 8)
-                        nv = min(nv, 18)
+                        if clipped:
+                            # No screen corners to interpolate between any more,
+                            # so walk the lattice in world space and project
+                            # each light. Costs more per light, but only on the
+                            # handful of faces you are standing right against —
+                            # and those are the most visible surface in the
+                            # frame, so dropping their windows is not an option.
+                            w0, w1, w2, w3 = wpts
+                            sw = math.hypot(w1[0] - w0[0], w1[1] - w0[1])
+                            nu = min(24, max(1, int(sw / 0.20)))
+                            nv = min(40, max(2, int(h / 0.34)))
+                        else:
+                            a0, a1, a2, a3 = pts
+                            # lattice spacing comes from the face's size *on
+                            # screen*, else a distant block gets a light a pixel
+                            bw = math.hypot(a1[0] - a0[0], a1[1] - a0[1])
+                            bh_ = math.hypot(a3[0] - a0[0], a3[1] - a0[1])
+                            nu = int(bw / 3.6)
+                            nv = int(bh_ / 3.0)
+                            if nu < 1 or nv < 2:
+                                continue
+                            # a near wall fills the buffer, and 8x18 lights
+                            # spread over it read as giant sparse dots
+                            nu = min(nu, 24 if walk else 8)
+                            nv = min(nv, 40 if walk else 18)
+                        # after the sizing, not before: the budget running out
+                        # has to fall in the same place it always did, or a
+                        # different set of faces keeps its lights
                         if win_budget <= 0:
                             break
                         for iv in range(nv):
@@ -1560,42 +2315,85 @@ def main():
                                 if ((s >> 3) ^ int(sim * 1.7 + iv)) & 63 == 0:
                                     continue
                                 fu = (iu + 0.5) / nu
-                                bx = a0[0] + (a1[0] - a0[0]) * fu
-                                by = a0[1] + (a1[1] - a0[1]) * fu
-                                tx = a3[0] + (a2[0] - a3[0]) * fu
-                                ty = a3[1] + (a2[1] - a3[1]) * fu
-                                ras.point(int(bx + (tx - bx) * fv),
-                                          int(by + (ty - by) * fv), wc)
+                                if clipped:
+                                    lx = w0[0] + (w1[0] - w0[0]) * fu
+                                    ly = w0[1] + (w1[1] - w0[1]) * fu
+                                    p = view(lx, ly, h * fv)
+                                    if p[2] < ZNEAR:
+                                        continue
+                                    q = toscreen(p)
+                                    px_, py_ = q[0], q[1]
+                                    if not (0 <= px_ < pxw and 0 <= py_ < pxh):
+                                        continue
+                                else:
+                                    bx = a0[0] + (a1[0] - a0[0]) * fu
+                                    by = a0[1] + (a1[1] - a0[1]) * fu
+                                    tx = a3[0] + (a2[0] - a3[0]) * fu
+                                    ty = a3[1] + (a2[1] - a3[1]) * fu
+                                    px_ = bx + (tx - bx) * fv
+                                    py_ = by + (ty - by) * fv
+                                ras.point(int(px_), int(py_), wc)
                                 win_budget -= 1
 
                 # ---- aircraft warning beacon on the real landmarks ----
                 if h > HMAX * 0.62:
                     if math.sin(sim * 2.2 + b.node.seed) > 0.55:
-                        bp = proj((x0 + x1) * 0.5, (y0 + y1) * 0.5, h + 0.6)
-                        ras.point(int(bp[0]), int(bp[1]), P['alert'])
-                        ras.point(int(bp[0]), int(bp[1]) - 1, P['alert'])
+                        cxm, cym = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+                        if walk:
+                            vp = view(cxm, cym, h + 0.6)
+                            # a beacon behind you used to have its divisor
+                            # clamped and could land back on screen as a phantom
+                            bp = toscreen(vp) if vp[2] >= ZNEAR else None
+                        else:
+                            bp = proj(cxm, cym, h + 0.6)
+                        if bp is not None:
+                            ras.point(int(bp[0]), int(bp[1]), P['alert'])
+                            ras.point(int(bp[0]), int(bp[1]) - 1, P['alert'])
 
             # ---- selection reticle ----
             if sel_node is not None and districts:
                 _, (rx, ry, rw, rh) = districts[sel]
                 if rw > 0 and rh > 0:
                     sc_ = quant(lerp(P['sel'], P['beam'], 0.4))
-                    c = [proj(rx, ry, 0.15), proj(rx + rw, ry, 0.15),
-                         proj(rx + rw, ry + rh, 0.15), proj(rx, ry + rh, 0.15)]
+                    cw = ((rx, ry), (rx + rw, ry), (rx + rw, ry + rh),
+                          (rx, ry + rh))
                     # dashed, and drawn over the blocks: it has to be findable
                     # even when the district is behind the skyline
                     for i in range(4):
-                        a, b2 = c[i], c[(i + 1) % 4]
+                        aw, bw = cw[i], cw[(i + 1) % 4]
+                        if walk:
+                            s_ = clip_seg(view(aw[0], aw[1], 0.15),
+                                          view(bw[0], bw[1], 0.15))
+                            if s_ is None:
+                                continue
+                            a, b2 = toscreen(s_[0]), toscreen(s_[1])
+                        else:
+                            a = proj(aw[0], aw[1], 0.15)
+                            b2 = proj(bw[0], bw[1], 0.15)
+                        # A near-clipped vertex sits ~1e5 px out, and this loop
+                        # steps one pixel at a time, so it needs a bound.
                         n = int(max(abs(b2[0] - a[0]), abs(b2[1] - a[1])))
+                        if n > pxw + pxh:
+                            n = pxw + pxh
                         for s in range(n + 1):
                             if (s + int(sim * 9)) % 6 < 3:
                                 ras.point(int(a[0] + (b2[0] - a[0]) * s / max(n, 1)),
                                           int(a[1] + (b2[1] - a[1]) * s / max(n, 1)), sc_)
                     hh = max((b.h for b in blds if b.root is sel_node), default=1.0)
-                    a = proj(rx + rw / 2, ry + rh / 2, hh + 1.0)
-                    bm = proj(rx + rw / 2, ry + rh / 2, hh + 9.0 + 2.0 * pulse)
-                    ras.line(a[0], a[1], bm[0], bm[1],
-                             quant(shade(P['beam'], 0.5 + 0.5 * pulse)))
+                    bc_ = quant(shade(P['beam'], 0.5 + 0.5 * pulse))
+                    if walk:
+                        # From the street the reticle is under the skyline, so
+                        # the beam is the only thing that says where the
+                        # selection is. Run it from the ground up so it is
+                        # visible over the buildings between you and it.
+                        wline(rx + rw / 2, ry + rh / 2, 0.0,
+                              rx + rw / 2, ry + rh / 2,
+                              hh + 9.0 + 2.0 * pulse, bc_)
+                    else:
+                        a = proj(rx + rw / 2, ry + rh / 2, hh + 1.0)
+                        bm = proj(rx + rw / 2, ry + rh / 2,
+                                  hh + 9.0 + 2.0 * pulse)
+                        ras.line(a[0], a[1], bm[0], bm[1], bc_)
 
             # ---- overlay ----
             for r in range(rows):
@@ -1648,7 +2446,16 @@ def main():
                                      rw * rh < PLOT * PLOT * 0.010):
                         continue
                     hh = max((b.h for b in blds if b.root is n), default=1.0)
-                    p = proj(rx + rw / 2, ry + rh / 2, hh + 2.5)
+                    if walk:
+                        # A rooftop label is off the top of the screen for
+                        # anything close, so from the street they hang at
+                        # head height instead and read as signs.
+                        vp = view(rx + rw / 2, ry + rh / 2, 1.0)
+                        if vp[2] < ZNEAR or vp[2] > fog_far:
+                            continue    # behind you, or lost in the fog
+                        p = toscreen(vp)
+                    else:
+                        p = proj(rx + rw / 2, ry + rh / 2, hh + 2.5)
                     r = int(p[1] / 2)
                     if r < 0 or r >= rows - 1:
                         continue
@@ -1768,7 +2575,11 @@ def main():
                     stat_l = (f'{human(cur.size)} · {commas(cur.files)} files · '
                               f'{commas(nsub)} subdir{"" if nsub == 1 else "s"}')
                 otext(rows - 1, panel + 2, stat_l, H)
-                keys = 'j/k select  ENTER descend  BKSP up  h help  q quit'
+                if walk:
+                    keys = ('wasd move  ←→ turn  ↑↓ look  ENTER enter  '
+                            'x mark  W orbit')
+                else:
+                    keys = 'j/k select  ENTER descend  BKSP up  h help  q quit'
                 if cols - panel - len(stat_l) - 8 > len(keys):
                     otext(rows - 1, cols - len(keys) - 1, keys, HD)
                 fpsl = f' {fps_avg:4.1f}fps  {len(blds)} blocks  {footprint} '
@@ -1776,6 +2587,53 @@ def main():
                 if marked:
                     m = f' {len(marked)} MARKED '
                     otext(0, cols - len(fpsl) - len(m), m, AL, bar_bg)
+
+            if walk and not zen:
+                # ---- compass ----
+                # A treemap has no landmarks and every alley looks like every
+                # other one, so without a heading the mode is a maze. The
+                # marks are world directions; the tick is the selection.
+                cw0, cwn = panel + 1, cols - panel - 2
+                if cwn > 20:
+                    bar_bg2 = quant(shade(P['sky'][0], 0.8))
+                    ofill(0, cw0, 1, cwn, bar_bg2)
+                    span = 2.4                      # radians across the strip
+                    # Offset to the right of the crosshair is az - bearing, not
+                    # the other way round: xr rotates the world by -az, so a
+                    # thing on your screen-right has the *smaller* bearing.
+                    # The labels are bearings too, hence E at -pi/2, which is
+                    # world +x -- the direction plan view draws to the right.
+                    for lab, ang in (('N', 0.0), ('E', -math.pi / 2),
+                                     ('S', math.pi), ('W', math.pi / 2)):
+                        d = (az - ang + math.pi) % (2 * math.pi) - math.pi
+                        if abs(d) < span / 2:
+                            c = cw0 + int((d / span + 0.5) * cwn)
+                            if cw0 <= c < cw0 + cwn:
+                                otext(0, c, lab, H, bar_bg2)
+                    if sel_node is not None and districts:
+                        _, (rx, ry, rw, rh) = districts[sel]
+                        bd = math.atan2(-(rx + rw / 2 - camX),
+                                        ry + rh / 2 - camY)
+                        d = (az - bd + math.pi) % (2 * math.pi) - math.pi
+                        if abs(d) < span / 2:
+                            c = cw0 + int((d / span + 0.5) * cwn)
+                            if cw0 <= c < cw0 + cwn:
+                                otext(0, c, '▼', P['sel'], bar_bg2)
+
+                # ---- crosshair and what it is on ----
+                ccol, crow = (panel + cols) // 2, rows // 2
+                otext(crow, ccol, '+', H)
+                if walk_target is not None:
+                    n = walk_target.node
+                    card = [f' {n.name[:24]} ',
+                            f' {human(n.size)} · {commas(n.files)} files ']
+                    cwid = max(len(s) for s in card)
+                    cr = min(rows - 4, crow + 2)
+                    cc = max(panel + 1, min(ccol - cwid // 2, cols - cwid - 1))
+                    ofill(cr, cc, len(card), cwid, PN)
+                    for i, s in enumerate(card):
+                        otext(cr + i, cc, s.ljust(cwid),
+                              H if i == 0 else HD, PN)
 
             if flash and now < flash_until:
                 msg = f'[ {flash} ]'
@@ -1785,9 +2643,10 @@ def main():
             if show_help:
                 # the legend lives here because the colour coding is otherwise
                 # undiscoverable — there was no way to learn what a tint meant
-                body = list(HELP_LINES) + ['', 'COLOUR = FILE TYPE'] + \
+                hl = WALK_HELP_LINES if walk else HELP_LINES
+                body = list(hl) + ['', 'COLOUR = FILE TYPE'] + \
                     [f'  {n}' for n in CAT_NAMES]
-                base = len(HELP_LINES) + 2
+                base = len(hl) + 2
                 # wrap to two columns rather than clipping: on a short terminal
                 # the legend is exactly what would have been cut off
                 ncol = 1

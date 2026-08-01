@@ -212,6 +212,126 @@ A smaller note on top of that: a key that is deliberately inert should be
 nothing was worse than doing nothing quietly — nobody needs to be told off by
 their own skyline.
 
+**Street level (`W`) — and what the earlier work paid for.**
+
+A first-person walk mode turned out to be mostly *already built*, and that is
+the interesting part. `bsp_order` is exact for any camera position, including
+one standing inside the plot, and the backface and roof tests were already
+per-block against the camera's true world position because perspective forced
+them to be. Both carried over untouched, and the ray-cast harness confirmed it:
+**0 pixel disagreements** from inside the city, the same bar the BSP cleared
+from orbit. Work done properly for one reason paid out for a different one.
+
+Four things genuinely had to be built, and three of them were only found by
+measuring.
+
+*The clamp was hiding a missing clip.* `if zv < 1.0: zv = 1.0` is safe only
+because the orbit camera is 210 units from a 100-unit plot. It is two bugs at
+street level: a wall straddling the eye plane folds inside out, and a wall you
+walk toward stops growing. The fix is Sutherland-Hodgman against `zv >= ZNEAR`,
+run on the camera-space triples *before* the divide — all three components are
+linear in world position there, so the crossing point is exact. `Raster.fill`
+already handled the resulting 3-to-5-gons, being a general convex fill, which is
+also why true pitch cost nothing.
+
+*Clipping is necessary but not sufficient.* A clipped vertex projects to ~1e5
+px. `fill` clamps its spans, but `line` steps one pixel at a time and merely
+*tests* each for being on screen: a single clipped grid line measured **91 ms**.
+Needed a screen-space segment clip as well (2075x faster on that case). And
+`fill` derives its gradient from the polygon's own extent, so a clipped wall put
+the whole visible surface into one slice of the ramp and rendered flat — hence
+the `yref` parameter, defaulted so nothing that does not clip moves a pixel.
+
+*Two culls, both wrong the first time, both caught by rasterising.* Painter's
+has no occlusion culling, so from inside the city everything is drawn at close
+range unless thrown away first. The first attempt tested the footprint's four
+corners against a 2D wedge. That is only right at zero pitch: looking up, a tall
+block's top has a larger `zv` than its base and swings toward the centre of the
+screen, so a block whose *footprint* is outside can be plainly visible — 64
+wrongly dropped over 408 sample views. The second was the distance cull reading
+the footprint *centre*, so a district-sized block with its near edge in your
+face got dropped. Both fixed by testing the whole box: `xr`, `zv` and the plane
+functions are linear, so the extreme over an axis-aligned box is its centre plus
+the extents weighted by |coefficient| — exact, and cheaper than projecting eight
+corners. Result: 0 visible blocks culled, and street level runs at **1.1-1.4 ms
+a frame against orbit's 6.1-6.3** — cheaper than the view it replaced.
+
+*The measurement that answered the wrong question.* The first street survey
+measured the gap between neighbouring blocks and found 75 of 238 under 0.4
+units, which said "widen the streets". A second measurement — occupancy grid,
+distance transform, flood fill — said the opposite: the shipped layout is
+already **one connected component** for a 0.3-radius walker, 24% of the plot
+traversable, all 39 districts reachable. Connectivity is the wrong question too.
+The one that matters is dynamic, and only a fuzz over half a million substeps
+asked it: a walker wedged in a gap narrower than twice its radius has **no legal
+position at all** — pushing it off one wall pushes it into the other, for ever.
+The shipped layout leaves it up to 0.13 units inside a building and no number of
+resolution passes fixes it (16 passes still left 0.047). Shrinking the walker
+does not work either; at radius 0.14 it is still 0.04 inside, because the layout
+emits blocks as thin as 0.04 whatever you do. Street level therefore relays out
+at `STREET 0.50, min_plot 4.0` — 124 blocks instead of 261, and **zero
+penetration over 580k substeps across two trees**. *Reachable is not the same as
+walkable, and neither is visible in a static measurement.*
+
+Two pre-existing bugs surfaced on the way and were fixed on their own merits.
+`Keyboard._parse` consumed a fixed three characters for a CSI sequence, so every
+parameterised escape spilled its parameters into the stream as ordinary keys:
+shift+Up arrived as `ESC ; 2 A` and that bare `2` switched the palette, a mouse
+click emitted `2`, `3` and `4`, and a bracketed paste emitted `0`, which reset
+the view. Harmless while the arrows were a secondary control; not once they
+steer. An unrecognised CSI is now swallowed rather than reported as `ESC`, since
+`ESC` ascends the tree and no terminal sends parameters to mean "the user
+pressed Escape". Separately, the roof outline was stroked on all four edges
+regardless of `roof_vis`, so from below the two *far* rooflines were drawn
+through solid wall — 31 pixels a frame at `--tilt 6`, and unmissable from the
+street where no roof is ever visible.
+
+The mode law from plan view held up as written: walk mode is `walk`, a position,
+a pitch, a forced pause, a fixed focal length and its own layout, `W` is the
+single entry and single exit, and `SPACE`, `t`, `j`/`k` are silently inert
+inside it. It also *rebinds* `w` and `s` (windows and starfield) to movement,
+which the law permits precisely because one piece of code puts the whole set
+back — verified by driving it through a pty and comparing the variable set
+before entry and after exit.
+
+One last note on method. The golden-frame gate — orbit and plan view must be
+byte-identical, 91 frames each — was worth more than any other test here, and it
+only worked once the harness itself was made deterministic. Baseline differed
+from *itself* until `PYTHONHASHSEED` was pinned, because `Node.seed` is
+`hash(name) & 0xffff` and Python randomises string hashing per process. A
+regression gate that has not been shown to pass against itself is measuring
+nothing. It is also why the free-camera projection was added *beside* the orbit
+one rather than replacing it: the general form is an algebraic superset, but
+subtracting the eye first reassociates the sums, and an ULP is enough to flip an
+`int(ceil(...))` and move a pixel.
+
+Two bugs the user found in the first hour of actually walking around, both of
+which every harness above was blind to for the same reason: they are *sign and
+naming* errors, and the harnesses all compared the renderer against itself.
+
+**The turn keys were mirrored, and so was the compass.** `xr = dx·ca + dy·sa`
+rotates the world by `-az`, so a thing on your screen-right has the *smaller*
+bearing: `az` counts anticlockwise. LEFT must therefore *add*. The same sign
+flipped the compass strip — it was placing labels at `bearing - az`, so the mark
+for a tower on your right appeared on your left. Nothing caught it because the
+ray-cast harness derived the view direction from the same `az` and agreed with
+itself perfectly; the id-buffer compared the painter against a ray cast, not
+against the word "left". The compass labels were separately in a left-handed
+order (E was world `-x`), so *both* halves had to be fixed together, and the
+check that finally settled it was the only one that couples the two independent
+paths: over 48000 samples, does the sign of a landmark's compass offset match the
+sign of its screen x? A self-consistent renderer can be consistently backwards.
+
+**A directory of nothing but files claimed to be a leaf.** `node.children` holds
+subdirectories only; loose bytes get a synthetic `(files here)` district that
+`layout()` manufactures on the fly. So ENTER's `if n.children:` test disagreed
+with `layout()` about whether there was a city to draw, and a folder of 47 GB of
+model weights — the single most interesting thing in that tree — refused to open.
+The fix (`enterable()`) mirrors `layout()`'s own `kids` test deliberately, so the
+two cannot drift apart again. The general lesson: when two places decide "is
+there anything here", they are one predicate, and writing it twice guarantees
+they will eventually disagree. Worth auditing the codebase for the other copies.
+
 ---
 
 ## Not built yet
