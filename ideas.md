@@ -179,7 +179,17 @@ elevation and a forced pause. The tilt keys cleared `plan` and moved the
 elevation, but left the other three, dropping the camera into a state that
 was neither a plan nor an orbit and that no key could name its way out of.
 The fix is not to make tilt restore the rest, it is to make tilt inert while
-in plan view, so `t` stays the single entry and the single exit.
+in plan view, so `t` stays the single entry and the single exit. Pause is inert
+there for the same reason: unpausing added the orbit spin on top of the ease
+holding the plan's heading square, the two fought, and from overhead that read
+as the plan drifting off true. Leaving plan view always resumes spinning — the
+pause belongs to the mode, not to the orbit you left, and carrying it back out
+just looked like the city had frozen.
+
+A smaller note on top of that: a key that is deliberately inert should be
+*silently* inert. Flashing "t FOR ORBIT" to explain why the arrow key did
+nothing was worse than doing nothing quietly — nobody needs to be told off by
+their own skyline.
 
 ---
 

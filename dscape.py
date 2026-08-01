@@ -34,7 +34,8 @@
    SPACE pause orbit    q quit          h help
    <- -> orbit          ^ v tilt        [ ] zoom      , . spin rate
    t     plan view: cranes the camera overhead and stops the spin, so the
-         city flattens into a plain treemap. t again returns to the orbit.
+         city flattens into a plain treemap. Tilt and pause do nothing while
+         it holds. t again returns to the orbit, spinning.
    j k   select         ENTER descend   BKSP ascend
  Past the directory you launched in, BKSP starts a fresh scan of the parent:
  the walk only ever went downward, so there is no tree above the root.
@@ -1147,8 +1148,15 @@ def main():
                 if k in ('q', 'Q', '\x03'):
                     raise KeyboardInterrupt
                 elif k == ' ':
-                    paused = not paused
-                    flash, flash_until = 'PAUSED' if paused else 'ORBIT', now + 0.8
+                    # Plan view is static by definition, so there is nothing to
+                    # pause. Unpausing there used to add the orbit spin on top
+                    # of the ease that holds the plan's heading square; the two
+                    # fought and settled at a skewed offset, which from
+                    # overhead read as the whole plan drifting off true.
+                    if not plan:
+                        paused = not paused
+                        flash, flash_until = ('PAUSED' if paused else 'ORBIT',
+                                              now + 0.8)
                 elif k == 'LEFT':
                     if az_target is None:
                         az -= 0.12
@@ -1166,7 +1174,7 @@ def main():
                     # which is neither a plan nor an orbit. `t` is the only way
                     # out, so every exit restores the whole set together.
                     if plan:
-                        flash, flash_until = 't FOR ORBIT', now + 0.8
+                        pass
                     elif k == 'UP':
                         el_target = min(math.radians(80), el_target + 0.05)
                     else:
@@ -1178,13 +1186,16 @@ def main():
                         # otherwise it reads as a tilted, splayed city rather
                         # than a plan. Snap to the nearest quarter turn so the
                         # camera takes the short way round.
-                        plan_restore = (el_target, paused)
+                        plan_restore = el_target
                         el_target, paused = math.pi / 2, True
                         az_target = round(az / (math.pi / 2)) * (math.pi / 2)
                         dist_target = 760.0
                         flash, flash_until = 'PLAN VIEW', now + 1.0
                     else:
-                        el_target, paused = plan_restore
+                        # always come back spinning. The pause belongs to plan
+                        # view, not to the orbit you left, so carrying it back
+                        # out just looked like the city had frozen.
+                        el_target, paused = plan_restore, False
                         az_target, dist_target = None, 210.0
                         flash, flash_until = 'ORBIT', now + 1.0
                 elif k == ']':
