@@ -332,6 +332,35 @@ two cannot drift apart again. The general lesson: when two places decide "is
 there anything here", they are one predicate, and writing it twice guarantees
 they will eventually disagree. Worth auditing the codebase for the other copies.
 
+**The ground grid is three states, not two.** `g` used to toggle it; it now
+cycles solid → x-ray → off. The measurement that justified it: a treemap fills
+the *entire* plot, so essentially every grid line is under a building. On a fixed
+frame the solid pass leaves 265 grid pixels of 2069 in orbit and 112 of 1277 at
+street level — **87–92% of the ground plane is hidden**, which is why the grid
+had always read as a few strokes near the plot edge rather than as a floor. Drawn
+after the blocks it reads as a proper ground plane, and at eye level it is a
+perspective grid running to the vanishing point, which is the only thing down
+there that says where on the plot you are.
+
+Two things that measurement got wrong first, both worth remembering:
+
+- **Comparing two live captures measures the animation, not the change.** The
+  first diff of solid against x-ray lit up the whole city, because between the
+  two captures the stars twinkled, the window lights flickered and the survey
+  beam swept. Anything compared across separate runs has to go through the
+  deterministic-clock harness the golden gate already uses; a screenshot diff of
+  an animated scene is noise with a signal somewhere in it.
+- **`ras.px` is a list of rows, so `zip` over it compares rows.** The first pixel
+  counts were 3–57 and looked plausible enough to quote. They were counts of
+  differing *rows*. A number that is not absurd is not thereby correct — the
+  check is whether it could be that number for the wrong reason.
+
+And a design point: the x-ray pass is drawn *brighter* than the solid one
+(`2.5` against `0.85`), not dimmer. The instinct was that an overlay should
+recede, but this one has to cross lit building faces, and at the solid pass's
+weight it simply vanished against them. It still goes before the reticle, which
+must win. No palette clips a channel at 2.5.
+
 ---
 
 ## Not built yet
