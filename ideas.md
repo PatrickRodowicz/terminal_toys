@@ -5,7 +5,7 @@ pure-Python stdlib, no pip installs, no runtime network calls, data baked in at
 build time where possible, and **real data wherever we can get it** — the things
 that read best are the ones that are actually true.
 
-Status as of 2026-08-01.
+Status as of 2026-08-02.
 
 ---
 
@@ -362,6 +362,93 @@ weight it simply vanished against them. It still goes before the reticle, which
 must win. No palette clips a channel at 2.5.
 
 ---
+
+### mechmodel.py — turntable rig for a battlemech
+
+The fourth program, and the first whose subject is not real data: a 65-tonne
+reverse-jointed walker modelled from a reference screenshot, orbiting on a
+turntable. It reuses dscape's raster, emitter, keyboard and orbit camera
+verbatim and replaces everything underneath.
+
+**The geometry layer is different in kind, and that is the whole point.**
+dscape gets its painter's order *exactly*, for free, because its blocks sit on
+a guillotine treemap and the plan's own cuts are a BSP. Nothing in a mech is
+axis-aligned and there is no plan, so facets carry true normals and sort by
+mean camera-space depth. That sort is wrong wherever two hulls interpenetrate
+— which here is only ever inside a joint, a bearing sunk into a limb or a ram
+buried in a calf, where the seam is hidden by the very parts that create it.
+Worth knowing that the cheap answer is fine when you can arrange for its
+failure mode to be invisible.
+
+**One primitive, not twenty.** Everything — armour plate, hydraulic ram,
+cockpit blister, missile rack, splayed toe — is a *loft*: a stack of
+cross-section rings joined ring to ring by quads and closed with n-gon caps. A
+box is two rectangular rings; a ram is two circular ones; the torso pod is nine
+ellipse rings on an egg profile. `Raster.fill` already takes any convex polygon,
+so the caps cost nothing. Detail that would be texture in a real engine is
+*geometry* instead: `grid_face` subdivides a planar quad into a coloured cell
+grid, and that one function draws the missile bores, the hazard chevrons and
+the heat-sink louvres.
+
+**Normals are oriented outward from each part's own centroid at build time.**
+Every primitive here is star-shaped about its centre, so this is exact, and it
+means the loft generators never have to agree on a winding convention. That is
+a class of bug that costs an afternoon and shows up as one facet of one limb
+being inside-out from one angle only.
+
+**The mass column is measured, not typed.** Each part's volume is the
+divergence theorem taken over its own hull — `3V = Σ (p·n)·area` — times the
+density of its material. The one chosen number is the density itself,
+calibrated once so the machine weighs what its class is rated for. Same
+instinct as everywhere else in this repo: if a panel is going to show a number,
+make the number true.
+
+Lessons that generalise:
+
+- **A photograph's lighting is a specification.** The first cut used dscape's
+  night palette and one Lambert term, and the model read as a dark green
+  cut-out. Three changes fixed it together and none of them alone would have:
+  a daylight palette, a dim fill light roughly opposite the key so no flank
+  goes flat black, and a *hemisphere ambient* — upward faces tinted toward the
+  sky colour, downward faces toward a ground-bounce colour. The hemisphere term
+  is what tells a horizontal surface from a vertical one on the side the sun
+  never reaches, and at 0.16 it costs one `lerp` per facet.
+
+- **Detail finer than a pixel averages to mud.** The cockpit laminate was five
+  bands over 0.84 world units, which at this resolution is 1.8 pixels a band:
+  it rendered as a grey smudge and read as nothing. Two panes and one mullion
+  survive the downsample. Decide detail density in *screen* space, the same
+  lesson the window-light budget already taught.
+
+- **Paint the facet, don't float the decal.** A unit flash over a curved hull
+  has to guess an offset radius and z-fights when it guesses wrong. Painting a
+  quad the loft already generated is on the surface by construction.
+
+- **Never write to `sys.stdout` from a signal handler.** This one was found by
+  soak and would never have been found by eye. The frame emitter holds the
+  `BufferedWriter`'s lock for most of every frame — one 20 KB write into a pty
+  — and re-entering it from a handler raises `RuntimeError`, which the
+  defensive `except Exception: pass` wrapped around the teardown then swallows.
+  The process exits 0 having restored *nothing*: raw mode still set, cursor
+  still hidden. It failed **60 teardowns out of 60** and looked completely
+  clean from the outside. dscape already had this right — its handler only
+  appends to a `quitting` list and the frame loop tears down at the top of the
+  next iteration, where nothing is half-written. That pattern is now the house
+  rule, not an accident of how dscape happened to be written.
+
+- **A pty harness must keep draining through teardown.** Stop reading and the
+  child blocks on write, never gets round to processing the quit key, and
+  `waitpid` hangs forever. Two harnesses hit this before it was written down.
+
+- **Also: `--frames N` from the start.** Every measurement here — the size
+  sweep, the timing runs, the PNG inspections — goes through it, and adding it
+  early cost nothing.
+
+Verified: 0 failures over 56 terminal-size × flag combinations and all six
+palettes; 300 random keypresses including every unbound key and parameterised
+CSI sequences, no traceback, clean exit; 60/60 signal teardowns restoring the
+terminal; 9.4 ms/frame at 80×24 rising to 20.3 ms at 240×70, so 30 fps holds
+with room to spare.
 
 ## Not built yet
 
