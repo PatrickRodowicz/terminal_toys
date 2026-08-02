@@ -39,6 +39,7 @@
    python3 mechmodel.py --faces 20000   one custom facet budget
    python3 mechmodel.py --palette ice   field | matrix | amber | ice | plasma | blood
    python3 mechmodel.py --stats         print the mesh report and exit
+   python3 mechmodel.py --lighting key  cheaper shading, still solid-looking
    (also --tilt --az --dist --speed --fps --blocks --zen --lod --voxels
     --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames)
 
@@ -46,13 +47,16 @@
    SPACE pause spin   q quit         h help        0 reset
    <- -> orbit        ^ v tilt       [ ] zoom      , . spin rate
    d     detail       a occlusion    w wireframe   l labels
+   L     lighting: full / key / flat -- key drops the fill light, sheen,
+         ambient and fog; flat drops lighting altogether, which on a
+         one-material mesh leaves a silhouette.
    p     palette      1-6 direct     g grid x3     z zen      s stars
    j k   select part  e explode      i idle -- the built-in model only, and
          silently inert on a loaded mesh, which is one rigid shell with no
          joints to move and nothing to select between.
 """
 import sys, os, math, time, shutil, argparse, signal, random, select
-import colorsys, struct, array, json
+import colorsys, struct, array, json, zlib
 from collections import deque
 
 # --- ANSI -----------------------------------------------------------------
@@ -133,6 +137,12 @@ MATERIALS = {
     'green':  (74, 138, 66),
     'lamp':   (236, 232, 196),    # running lights, gun-lens glow
 }
+
+# Materials that are their own light source rather than a lit surface, so the
+# shader pulls them back toward their base colour. A dict rather than the
+# `mat in ('lamp', 'glass')` tuple scan it replaces, because that ran once per
+# facet per frame.
+SOFT_MAT = dict((m, m in ('lamp', 'glass')) for m in MATERIALS)
 
 # Tonnes per cubic metre of *enclosed hull*, not of solid material -- a limb
 # casing is mostly myomer bundle, coolant run and void, so the figure that
@@ -317,6 +327,67 @@ class Raster:
                     xb = W
                 if xb > xa:
                     row[xa:xb] = [c] * (xb - xa)
+
+    def fill3(self, a, b, c, col):
+        """fill(), specialised to a triangle in one flat colour.
+
+        Worth its own method because of what the facets actually measure: on
+        the STL at 80x24 a facet covers 0.93 scanlines and 2.3 pixels. At that
+        size the generic fill's per-scanline overhead -- a fresh list, a loop
+        over every edge, two appends, a length test, sometimes a sort -- IS the
+        cost, and the slice assignment the whole raster design exists to reach
+        is writing two pixels. Sorting the three vertices once and walking the
+        long edge against one short edge removes all of it.
+
+        The arithmetic is deliberately kept in the same order as fill() --
+        dx precomputed but still divided by dy, never multiplied by a
+        reciprocal -- so this is bit-for-bit the same picture, which was
+        checked rather than assumed.
+        """
+        if a[1] > b[1]:
+            a, b = b, a
+        if b[1] > c[1]:
+            b, c = c, b
+        if a[1] > b[1]:
+            a, b = b, a
+        ay, by, cy = a[1], b[1], c[1]
+        y0 = int(math.ceil(ay - 0.5))
+        y1 = int(math.floor(cy - 0.5))
+        if y0 < 0:
+            y0 = 0
+        if y1 >= self.h:
+            y1 = self.h - 1
+        if y1 < y0:
+            return
+        dyl = cy - ay
+        if dyl == 0.0:
+            return
+        ax, bx, cx = a[0], b[0], c[0]
+        dxl = cx - ax
+        d1x, d1y = bx - ax, by - ay
+        d2x, d2y = cx - bx, cy - by
+        px, W = self.px, self.w
+        for y in range(y0, y1 + 1):
+            yc = y + 0.5
+            xl = ax + dxl * (yc - ay) / dyl
+            if yc < by:
+                if d1y == 0.0:
+                    continue
+                xr = ax + d1x * (yc - ay) / d1y
+            else:
+                if d2y == 0.0:
+                    continue
+                xr = bx + d2x * (yc - by) / d2y
+            if xl > xr:
+                xl, xr = xr, xl
+            xa = int(math.ceil(xl - 0.5))
+            xb = int(math.floor(xr - 0.5)) + 1
+            if xa < 0:
+                xa = 0
+            if xb > W:
+                xb = W
+            if xb > xa:
+                px[y][xa:xb] = [col] * (xb - xa)
 
     def line(self, x0, y0, x1, y1, c):
         dx, dy = x1 - x0, y1 - y0
@@ -675,7 +746,14 @@ class Part:
         cy = sum(p[1] for p in mesh.v) / len(mesh.v)
         cz = sum(p[2] for p in mesh.v) / len(mesh.v)
         self.centroid = (cx, cy, cz)
-        rng = random.Random(hash(name) & 0xffff)
+        # crc32, not hash(): hash() of a str is salted per process, so the
+        # weathering pattern came out different on every launch and no two
+        # runs of the program ever drew the same frame. Invisible to the eye
+        # -- it is a +-5% brightness jitter -- but it makes the renderer
+        # unreproducible, which showed up the moment a pixel diff was used to
+        # check an optimisation and the control run disagreed with itself on
+        # 7% of pixels.
+        rng = random.Random(zlib.crc32(name.encode()) & 0xffff)
         self.wear = []
         self.wear_plain = []
         for _fi, (idx, mat) in enumerate(mesh.f):
@@ -725,6 +803,26 @@ AO_FLOOR = 0.34
 # everything the sky and the ground bounce back sideways.
 SUN = normed((0.52, -0.66, 0.54))          # direction *toward* the sun
 FILL = normed((-0.62, 0.48, 0.18))
+
+# Lighting cost, traded against how much of the model you can still read.
+#   FULL  key + fill + sheen + hemisphere ambient + fog -- the look as built
+#   KEY   the key light alone. Still legibly three-dimensional, ~20% cheaper
+#         than FULL at the shading stage.
+#   FLAT  no lighting at all. Honest warning: on a single-material mesh like
+#         the STL this is a featureless silhouette -- every facet takes the
+#         same colour and the machine becomes a green cut-out. It is the
+#         fastest thing the renderer can draw and it buys about a millisecond
+#         over KEY, which is why KEY is the one worth reaching for.
+LIGHT_FULL, LIGHT_KEY, LIGHT_FLAT = 0, 1, 2
+LIGHT_NAMES = ('LIGHTING FULL', 'LIGHTING KEY ONLY', 'LIGHTING FLAT')
+LIGHT_ARGS = ('full', 'key', 'flat')
+
+# A facet gets a top-to-bottom gradient only if it is at least this tall on
+# screen. The gradient is what makes a cylindrical limb on the built-in model
+# read as round -- but STL facets average 0.93 scanlines at 80x24, and a
+# gradient across one scanline is one colour bought at the price of a lerp and
+# a quant on every scanline of every facet. So spend it only where it shows.
+GRAD_MIN_H = 5.0
 
 
 # --- STL ------------------------------------------------------------------
@@ -1680,14 +1778,21 @@ HELP = [
     '[ ]    zoom                     , .    spin rate',
     'd      detail: low / med / high a      ambient occlusion',
     'w      wireframe                l      labels',
-    'j k    select a part            e      exploded view',
-    'g      grid: solid / x-ray/ off i      idle animation',
-    'p      cycle palette            1-6    palette direct',
-    's      starfield                z      zen (hide the HUD)',
-    '0      reset the view           h      this help',
+    'L      lighting: full/key/flat  j k    select a part',
+    'g      grid: solid / x-ray/ off e      exploded view',
+    'p      cycle palette            i      idle animation',
+    's      starfield                1-6    palette direct',
+    '0      reset the view           z      zen (hide the HUD)',
+    'h      this help',
     '',
     'On a loaded mesh, j k e and i are inert: it is a single',
     'watertight shell with no joints and no parts to separate.',
+    '',
+    'L trades lighting for frame rate. key keeps the key light',
+    'and drops the fill, the sheen, the ambient and the fog --',
+    'still solid-looking, about 20% off the shading stage. flat',
+    'drops lighting entirely; on a one-material mesh that leaves',
+    'a silhouette, so it is a speed floor, not a view.',
     '',
     'Everything in the panel is measured off the mesh -- the',
     'decimation error against the source, the enclosed volume,',
@@ -1727,6 +1832,9 @@ def main():
     ap.add_argument('--no-stars', action='store_true')
     ap.add_argument('--no-shadow', action='store_true')
     ap.add_argument('--no-idle', action='store_true')
+    ap.add_argument('--lighting', default='full', choices=LIGHT_ARGS,
+                    help='full / key (key light only) / flat (no lighting; '
+                         'a single-material mesh becomes a silhouette)')
     ap.add_argument('--stats', action='store_true')
     ap.add_argument('--frames', type=int, default=0,
                     help='render N frames and exit (harness use)')
@@ -1854,6 +1962,7 @@ def main():
     stars_on = not args.no_stars
     shadow_on = not args.no_shadow
     idle_on = not args.no_idle
+    light_mode = LIGHT_ARGS.index(args.lighting)
     labels = False
     wire = False
     explode = 0.0
@@ -1989,6 +2098,9 @@ def main():
                                           now + 0.8)
                 elif k == 'l':
                     labels = not labels
+                elif k == 'L':
+                    light_mode = (light_mode + 1) % 3
+                    flash, flash_until = LIGHT_NAMES[light_mode], now + 0.9
                 elif k == 'g':
                     grid_mode = (grid_mode + 1) % 3
                     flash, flash_until = GRID_NAMES[grid_mode], now + 0.8
@@ -2183,15 +2295,56 @@ def main():
                 # Occlusion lives inside the per-face brightness multiplier, so
                 # toggling it is a choice of list, not a branch in the shader.
                 wr = p.wear if ao_on else p.wear_plain
-                sp = [proj(*w) for w in wv]
+                # proj() inlined. It is a closure called once per vertex, and
+                # at a few thousand vertices the call and its cell lookups cost
+                # more than the arithmetic inside it.
+                fsub = Fl * SUBX
+                sp = []
+                spa = sp.append
+                for w in wv:
+                    wx, wy, wz = w
+                    wz -= MCZ
+                    xr = wx * ca + wy * sa
+                    yr = -wx * sa + wy * ca
+                    zv = yr * ce - wz * se + DIST
+                    if zv < 0.6:
+                        zv = 0.6
+                    spa((OX + fsub * xr / zv,
+                         OY - Fl * (yr * se + wz * ce) / zv, zv))
+
+                # World normals depend only on the part's frame matrix -- and
+                # the turntable spins the camera, not the mech, so on a still
+                # pose every normal is the one computed last frame. Cache them
+                # against the matrix itself: a pose that really does move (idle
+                # sway, explode, a part selected and pulled out) fails the
+                # comparison and recomputes, so this is exact, not an
+                # approximation.
+                nw = p.__dict__.get('_nw')
+                if nw is None or p._nw_M != M:
+                    m0, m1, m2, m3, m4, m5, m6, m7, m8 = M
+                    nw = [(m0 * ln[0] + m1 * ln[1] + m2 * ln[2],
+                           m3 * ln[0] + m4 * ln[1] + m5 * ln[2],
+                           m6 * ln[0] + m7 * ln[1] + m8 * ln[2])
+                          for _i, _m, ln, _c in p.faces]
+                    p._nw, p._nw_M = nw, M
+
+                qa = queue.append
                 for fi, (idx, mat, ln, lc) in enumerate(p.faces):
-                    n = mvec(M, ln)
+                    n = nw[fi]
                     a = wv[idx[0]]
                     # Backface test against the eye, not against a global
                     # azimuth: under perspective the two disagree at the edges
                     # of a wide model and the disagreement is a hole.
                     if ((camX - a[0]) * n[0] + (camY - a[1]) * n[1] +
                             (camZ - a[2]) * n[2]) <= 0.0:
+                        continue
+                    if len(idx) == 3:
+                        s0 = sp[idx[0]]
+                        s1 = sp[idx[1]]
+                        s2 = sp[idx[2]]
+                        qa(((s0[2] + s1[2] + s2[2]) / 3,
+                            ((s0[0], s0[1]), (s1[0], s1[1]), (s2[0], s2[1])),
+                            mat, n, wr[fi], hot))
                         continue
                     zsum = 0.0
                     pts = []
@@ -2200,45 +2353,126 @@ def main():
                         pts.append((s[0], s[1]))
                         zsum += s[2]
                     zsum /= len(idx)
-                    queue.append((zsum, pts, mat, n, wr[fi], hot))
+                    qa((zsum, pts, mat, n, wr[fi], hot))
 
             queue.sort(key=lambda q: -q[0])
             drawn = len(queue)
 
             # ---- shade and fill ----
             sky_c, bounce_c = P['sky'][1], P['bounce']
+            # Everything the shader reads, hoisted out of the loop: attribute
+            # and global lookups are per-facet costs at a few thousand facets.
+            # The shader below is the same expression as ever, with shade() and
+            # lerp() inlined -- including their int() truncations, which is what
+            # makes it bit-for-bit identical to the version that called them
+            # rather than merely close to it.
+            S0, S1, S2 = SUN
+            F0, F1, F2 = FILL
+            b0, b1, b2 = bounce_c
+            ks0, ks1, ks2 = sky_c[0] - b0, sky_c[1] - b1, sky_c[2] - b2
+            fgr, fgg, fgb = fogc
+            fogd = 1.0 / (fog1 - fog0)
+            SCr, SCg, SCb = SC
+            soft = SOFT_MAT
+            rfill, rfill3 = ras.fill, ras.fill3
+            lm = light_mode
+
             for zsum, pts, mat, n, wear, hot in queue:
                 base = MAT[mat]
-                ndl = n[0] * SUN[0] + n[1] * SUN[1] + n[2] * SUN[2]
-                ndf = n[0] * FILL[0] + n[1] * FILL[1] + n[2] * FILL[2]
-                k = 0.30 + 0.72 * max(0.0, ndl) + 0.26 * max(0.0, ndf)
-                if ndl > 0.0:
-                    # A cheap metallic sheen: the same Lambert term raised hard,
-                    # so a face square to the sun gets a hot edge and the rest
-                    # of the hull stays matte. Without it every panel reads as
-                    # painted card.
-                    k += 0.55 * (ndl ** 9)
-                c = shade(base, k * wear)
-                # Hemisphere ambient: an upward face is under the sky and takes
-                # the sky's colour, a downward face is over the ground and takes
-                # the ground's. This is what tells a horizontal surface from a
-                # vertical one on the side the sun never reaches, and it is the
-                # cheapest single thing that stops the model reading as a
-                # cut-out. Weak on purpose -- at 0.16 it tints, it does not wash.
-                c = lerp(c, lerp(bounce_c, sky_c, 0.5 * (n[2] + 1.0)), 0.16)
-                if mat in ('lamp', 'glass'):
-                    c = lerp(c, base, 0.55)
-                fog = (zsum - fog0) / (fog1 - fog0)
-                if fog > 0.0:
-                    c = lerp(c, fogc, min(0.34, fog * 0.30))
+                n0, n1, n2 = n
+                if lm == LIGHT_FLAT:
+                    r, g, b = base
+                else:
+                    ndl = n0 * S0 + n1 * S1 + n2 * S2
+                    if lm == LIGHT_KEY:
+                        k = (0.34 + 0.78 * ndl) if ndl > 0.0 else 0.34
+                        k *= wear
+                        r = int(base[0] * k)
+                        g = int(base[1] * k)
+                        b = int(base[2] * k)
+                    else:
+                        ndf = n0 * F0 + n1 * F1 + n2 * F2
+                        k = 0.30
+                        if ndl > 0.0:
+                            # A cheap metallic sheen: the same Lambert term
+                            # raised hard, so a face square to the sun gets a
+                            # hot edge and the rest of the hull stays matte.
+                            # Without it every panel reads as painted card.
+                            # ndl**9 as three squarings, not a pow() call.
+                            x2 = ndl * ndl
+                            x4 = x2 * x2
+                            k += 0.72 * ndl + 0.55 * x4 * x4 * ndl
+                        if ndf > 0.0:
+                            k += 0.26 * ndf
+                        k *= wear
+                        r = int(base[0] * k)
+                        g = int(base[1] * k)
+                        b = int(base[2] * k)
+                    if r > 255:
+                        r = 255
+                    elif r < 0:
+                        r = 0
+                    if g > 255:
+                        g = 255
+                    elif g < 0:
+                        g = 0
+                    if b > 255:
+                        b = 255
+                    elif b < 0:
+                        b = 0
+                if lm == LIGHT_FULL:
+                    # Hemisphere ambient: an upward face is under the sky and
+                    # takes the sky's colour, a downward face is over the ground
+                    # and takes the ground's. This is what tells a horizontal
+                    # surface from a vertical one on the side the sun never
+                    # reaches, and it is the cheapest single thing that stops
+                    # the model reading as a cut-out. Weak on purpose -- at 0.16
+                    # it tints, it does not wash.
+                    t = 0.5 * (n2 + 1.0)
+                    ar = int(b0 + ks0 * t)
+                    ag = int(b1 + ks1 * t)
+                    ab = int(b2 + ks2 * t)
+                    r = int(r + (ar - r) * 0.16)
+                    g = int(g + (ag - g) * 0.16)
+                    b = int(b + (ab - b) * 0.16)
+                    if soft[mat]:
+                        r = int(r + (base[0] - r) * 0.55)
+                        g = int(g + (base[1] - g) * 0.55)
+                        b = int(b + (base[2] - b) * 0.55)
+                    fog = (zsum - fog0) * fogd
+                    if fog > 0.0:
+                        fog *= 0.30
+                        if fog > 0.34:
+                            fog = 0.34
+                        r = int(r + (fgr - r) * fog)
+                        g = int(g + (fgg - g) * fog)
+                        b = int(b + (fgb - b) * fog)
                 if hot:
-                    c = lerp(c, SC, 0.34)
-                ras.fill(pts, quant(shade(c, 1.05)), quant(shade(c, 0.93)))
+                    r = int(r + (SCr - r) * 0.34)
+                    g = int(g + (SCg - g) * 0.34)
+                    b = int(b + (SCb - b) * 0.34)
+                # Gradient only where it can be seen -- see GRAD_MIN_H.
+                ylo = yhi = pts[0][1]
+                for pt in pts:
+                    py = pt[1]
+                    if py < ylo:
+                        ylo = py
+                    elif py > yhi:
+                        yhi = py
+                if yhi - ylo >= GRAD_MIN_H:
+                    c = (r, g, b)
+                    rfill(pts, quant(shade(c, 1.05)), quant(shade(c, 0.93)))
+                elif len(pts) == 3:
+                    p0, p1, p2 = pts
+                    rfill3(p0, p1, p2,
+                           (r // 6 * 6, g // 6 * 6, b // 6 * 6))
+                else:
+                    rfill(pts, (r // 6 * 6, g // 6 * 6, b // 6 * 6))
                 if wire:
-                    wc = quant(shade(c, 1.9))
+                    wc = quant(shade((r, g, b), 1.9))
                     for i in range(len(pts)):
-                        a, b = pts[i - 1], pts[i]
-                        ras.line_c(a[0], a[1], b[0], b[1], wc)
+                        a, b_ = pts[i - 1], pts[i]
+                        ras.line_c(a[0], a[1], b_[0], b_[1], wc)
 
             # ---- overlay ----
             H, HD, PN = P['hud'], P['hud_dim'], P['panel']

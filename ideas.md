@@ -541,6 +541,81 @@ Verified after the mesh work: 110 size × flag combinations and all six palettes
 teardowns; 24.4 ms/frame at 80×24 to 38.6 ms at 240×70 on the middle detail
 level, with `d` there to buy it back.
 
+#### Making it fast — and what measuring first was worth
+
+Asked to find more speed, I predicted the emitter would dominate at large
+terminal sizes, because it scales with cell count and the frame cost had grown
+with the terminal. **Wrong.** Instrumenting the frame loop at its own stage
+boundaries: the emitter is 3–15%, and `shade` is 57–59% at *every* size, with
+`gather` another 19–28%. Splitting `shade` in two explained why the size
+independence: the lighting arithmetic is ~8.5 ms/frame regardless of terminal
+size, because it is per-facet and ~3100 facets survive the backface cull no
+matter how big the window is.
+
+The number that reframed everything was **0.93 scanlines and 2.3 pixels per
+facet** at 80×24. The raster's whole design — spans written by list slice
+assignment — is built to make long runs cheap, and at this facet size there are
+no long runs. The per-scanline *fixed* cost is the entire bill: a fresh list, a
+loop over every edge, two appends, a length test, sometimes a sort. Which
+means the biggest single win was something that looks like a rounding error:
+**every facet was being filled with a top-to-bottom gradient**, costing a
+`lerp` and a `quant` on every scanline, to shade a facet one pixel tall.
+
+Four changes, all of them things measurement pointed at rather than things that
+looked slow:
+
+- **A triangle-only rasteriser.** Sort three vertices once, walk the long edge
+  against one short edge, no allocation per scanline.
+- **The gradient only where it can be seen** (`GRAD_MIN_H`, 5 px). Not global:
+  the built-in model's facets are big loft quads and the gradient is what makes
+  a cylindrical limb read as round — dropping it there flattens the legs
+  visibly. The STL's facets are a pixel tall and it shows nothing. Same code,
+  opposite answers, so the test has to be per facet.
+- **The shader inlined**, `shade`/`lerp`/`quant` unrolled to scalar arithmetic,
+  `ndl**9` as three squarings instead of a `pow`.
+- **A world-normal cache.** The turntable spins the *camera*, not the mech, so
+  on a still pose every normal equals last frame's. Keyed on the frame matrix
+  itself, so a pose that really moves fails the comparison and recomputes.
+
+Result on the STL: **20.8 → 13.0 ms** at 80×24 and 38.5 → 25.3 at 240×70. The
+built-in model gains only ~10%, because its large facets keep the gradient —
+worth stating plainly rather than quoting the good number twice.
+
+**The lesson that cost the most time: the renderer was not reproducible.**
+Per-facet weathering seeded from `random.Random(hash(name) & 0xffff)` — and
+`hash()` of a *str* is salted per process, so every launch weathered the mesh
+differently. Invisible (±5% brightness jitter), and harmless until a pixel diff
+was used to check an optimisation: variants disagreed with the reference on 25%
+of pixels, and the differences did not correlate with the changes. A **control
+run of a build against itself came back 92.969% identical** — the harness was
+measuring noise. Two causes, both found only because of that control: the
+salted hash, and the spin integrating real wall-clock `dt`, so frame 40 lands
+at a different azimuth every run. Fixed with `zlib.crc32` and a pinned `dt`.
+*Always run the null comparison.* A diff harness that cannot show 100% on
+identical inputs cannot show anything.
+
+With that fixed the claims are provable rather than plausible: forcing the
+gradient on, the optimised renderer is **100% pixel-identical** to the original
+on both models at both sizes — that is the rasteriser, the inlined projection,
+the normal cache and the inlined shader, all proved equivalent rather than
+argued to be. The exact-inlined shader costs 0.7 ms over a loose float version
+that was 95% identical; worth paying to be able to say *identical*. And the
+normal cache — the one change justified by an argument about invalidation
+rather than by algebra — was driven under idle sway and mid-explode, where
+every limb frame changes every frame, and matched at every sampled frame.
+
+**On `--lighting`, which was asked for as "turn lighting off for speed".**
+Measuring it honestly meant reporting that the obvious version is a bad deal:
+fully unlit is the fastest thing the renderer can draw, but on a
+single-material mesh every facet takes the same colour and the mech becomes a
+**featureless green silhouette** — and it only buys ~1 ms over keeping the key
+light. So `L` cycles three states: `full`, `key` (key light alone — still
+solid-looking, ~20% off the shading stage), and `flat` (kept, documented as a
+speed floor rather than a view). `--no-shadow` already existed and saves ~0.8
+ms, about 3%; the cast shadow was never the problem.
+
+Still on the table, unmeasured: the emitter is 15% at 240×70 and untouched.
+
 ## Not built yet
 
 ### 1. Falling-code rain, fed from something real
