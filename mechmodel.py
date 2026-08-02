@@ -1,47 +1,59 @@
 #!/usr/bin/env python3
 """
- MECHMODEL // turntable rig for a 65-ton assault walker
- ------------------------------------------------------
- A reverse-jointed battlemech, built out of lofted convex hulls and drawn in a
- terminal at half-block resolution. Same renderer family as dscape.py -- the
- 1x2 pixel buffer, the quadrant-glyph emitter, the orbit camera -- but the
- geometry underneath is different in kind: dscape draws axis-aligned boxes on a
- guillotine plan and gets its painter's order exactly from the plan's own cuts.
- Nothing here is axis-aligned, so faces carry true normals and sort by depth.
+ MECHMODEL // turntable rig for a battlemech
+ -------------------------------------------
+ A 3D model on a slow-orbiting camera, drawn in a terminal at half-block
+ resolution. Same renderer family as dscape.py -- the 1x2 pixel buffer, the
+ quadrant-glyph emitter, the orbit camera -- but the geometry underneath is
+ different in kind: dscape draws axis-aligned boxes on a guillotine plan and
+ gets its painter's order exactly from the plan's own cuts. Nothing here is
+ axis-aligned, so facets carry true normals and sort by depth.
 
- The model is a bone hierarchy: 21 parts on 17 bones, 12.5 metres from sole to
- rack, every part hanging off a joint and every joint off its parent -- so the
- whole thing is one pose function away from walking. The legs are digitigrade,
- which is to say the knee breaks forward and the ankle trails behind the hip,
- and the chain is written as relative angles so the sole stays flat however the
- leg is posed.
+ Point it at an STL and it renders that. The reference model is 242,976
+ triangles and the renderer can afford a few thousand, so the mesh goes through
+ a pipeline first: vertex-cluster decimation to a facet budget, a voxel
+ occupancy grid flooded from the outside to find what is solid, and a
+ hemisphere of rays per facet for real ambient occlusion -- occlusion that sees
+ the arm hanging in front of the chest, not just local curvature. That is
+ seconds of work, so it is cached beside the source file and is a few
+ milliseconds thereafter. Three levels of detail are built; d cycles them.
 
- Mass in the panel is not decoration. Each part's volume is the divergence
- theorem taken over its own hull, and the mass is that volume times the density
- of the material -- the only figure chosen rather than measured is the density
- itself, calibrated once so the machine weighs the 65 tonnes its class is rated
- for. Press j and k to walk the structure list.
+ A few thousand facets is not a compromise. At this resolution the model covers
+ maybe 150x400 pixels, so it is already one facet per handful of pixels.
+
+ The panel is a mesh report, and all of it is measured: welded vertex count,
+ whether every edge is used exactly twice (which is what watertight means and
+ what makes the enclosed volume a real number), the decimation error against
+ the source, and the displacement and mass the thing would have if it were
+ really built 12 metres tall.
+
+ With --builtin, or with no STL to hand, it draws a mech assembled here out of
+ lofted convex hulls on a 17-bone skeleton -- articulated, so j and k walk the
+ structure list and e pulls it apart.
 
  Usage:
-   python3 mechmodel.py                 orbit the mech
-   python3 mechmodel.py --palette ice   field | ice | amber | matrix | plasma | blood
-   python3 mechmodel.py --tilt 24       camera elevation, degrees
-   python3 mechmodel.py --dist 34       camera distance
-   python3 mechmodel.py --speed 2       turntable rate (also live, with , and .)
-   python3 mechmodel.py --blocks half   coarser glyphs if quadrants look wrong
-   python3 mechmodel.py --az 215        starting azimuth, degrees
-   python3 mechmodel.py --stats         print the mass table and exit
-   (also --fps --zen --no-stars --no-shadow --no-idle --frames)
+   python3 mechmodel.py                 mc.stl if it is beside the script
+   python3 mechmodel.py thing.stl       any binary or ASCII STL
+   python3 mechmodel.py --builtin       the procedural mech instead
+   python3 mechmodel.py --up y          for a Y-up STL
+   python3 mechmodel.py --faces 20000   one custom facet budget
+   python3 mechmodel.py --palette ice   field | matrix | amber | ice | plasma | blood
+   python3 mechmodel.py --stats         print the mesh report and exit
+   (also --tilt --az --dist --speed --fps --blocks --zen --lod --voxels
+    --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames)
 
  Live controls (h for the full list):
    SPACE pause spin   q quit         h help        0 reset
    <- -> orbit        ^ v tilt       [ ] zoom      , . spin rate
-   j k   select part  e explode      w wireframe   l labels
+   d     detail       a occlusion    w wireframe   l labels
    p     palette      1-6 direct     g grid x3     z zen      s stars
-   i     idle animation -- small, slow and out of phase across the joints,
-         because a rig that is perfectly still reads as a photograph
+   j k   select part  e explode      i idle -- the built-in model only, and
+         silently inert on a loaded mesh, which is one rigid shell with no
+         joints to move and nothing to select between.
 """
-import sys, os, math, time, shutil, argparse, signal, random, select, colorsys
+import sys, os, math, time, shutil, argparse, signal, random, select
+import colorsys, struct, array, json
+from collections import deque
 
 # --- ANSI -----------------------------------------------------------------
 ESC = '\033['
@@ -217,6 +229,10 @@ def palette_materials(pal):
 
 
 # --- formatting -----------------------------------------------------------
+def commas(n):
+    return '{:,}'.format(int(n))
+
+
 def bar_str(frac, n=10):
     if frac < 0:
         frac = 0.0
@@ -637,7 +653,17 @@ class Part:
     being inside-out from one angle.
     """
 
-    def __init__(self, name, frame, mesh, group):
+    def __init__(self, name, frame, mesh, group, trust_winding=False,
+                 ao=None, wear_amp=0.09):
+        """`trust_winding` turns the outward-from-centroid pass OFF, for a mesh
+        that already has a consistent winding of its own -- an STL, say. The
+        centroid trick is exact for a star-shaped primitive and badly wrong for
+        a whole mech: a facet inside the armpit points *toward* the body centre,
+        and reorienting it would turn it inside out.
+
+        `ao` is a per-face occlusion factor in [0, 1], folded into the same
+        per-face brightness multiplier the weathering uses -- so occlusion
+        costs the shader exactly nothing at frame time."""
         self.name = name
         self.frame = frame
         self.group = group
@@ -651,7 +677,8 @@ class Part:
         self.centroid = (cx, cy, cz)
         rng = random.Random(hash(name) & 0xffff)
         self.wear = []
-        for idx, mat in mesh.f:
+        self.wear_plain = []
+        for _fi, (idx, mat) in enumerate(mesh.f):
             pts = [mesh.v[i] for i in idx]
             nx = ny = nz = 0.0
             for k in range(len(pts)):
@@ -666,7 +693,9 @@ class Part:
             fy = sum(p[1] for p in pts) / len(pts)
             fz = sum(p[2] for p in pts) / len(pts)
             n = (nx / area2, ny / area2, nz / area2)
-            if ((fx - cx) * n[0] + (fy - cy) * n[1] + (fz - cz) * n[2]) < 0:
+            if not trust_winding and (
+                    (fx - cx) * n[0] + (fy - cy) * n[1]
+                    + (fz - cz) * n[2]) < 0:
                 n = (-n[0], -n[1], -n[2])
                 idx = tuple(reversed(idx))
             # Divergence theorem: 3V = sum over faces of (p . n) * area.
@@ -676,10 +705,682 @@ class Part:
             self.faces.append((idx, mat, n, (fx, fy, fz)))
             # Deterministic per-face weathering: a few percent of brightness,
             # fixed at build time so it does not crawl as the model turns.
-            self.wear.append(1.0 + rng.uniform(-0.09, 0.07))
+            w = 1.0 + rng.uniform(-wear_amp, wear_amp * 0.78)
+            self.wear_plain.append(w)
+            self.wear.append(w * (AO_FLOOR + (1.0 - AO_FLOOR) * ao[_fi])
+                             if ao is not None else w)
         self.volume /= 3.0
         self.mass = abs(self.mass)
         self.volume = abs(self.volume)
+
+
+# --- ambient occlusion ------------------------------------------------------
+# How dark a fully occluded facet goes. Occlusion multiplies brightness, so 0.34
+# means a facet buried in an armpit keeps a third of its lit value -- enough to
+# stay a surface rather than become a hole.
+AO_FLOOR = 0.34
+
+# The light rig, world-fixed so the shading changes as the camera comes round.
+# SUN is the key; FILL is a dim, roughly opposite source standing in for
+# everything the sky and the ground bounce back sideways.
+SUN = normed((0.52, -0.66, 0.54))          # direction *toward* the sun
+FILL = normed((-0.62, 0.48, 0.18))
+
+
+# --- STL ------------------------------------------------------------------
+# Everything below turns a printable mesh into something a terminal can draw at
+# frame rate. The reference model is 242,976 triangles; the renderer can afford
+# a few thousand. That is not a compromise, it is the right number: at half-
+# block resolution the model covers roughly 150x400 pixels, so a few thousand
+# facets is already one facet per handful of pixels and more would be invisible.
+# The whole pipeline -- decimate, voxelise, occlude -- runs once and is cached.
+
+MODEL_H = 12.0            # world height every loaded model is normalised to
+LOD_TARGETS = (2600, 6200, 14000)
+LOD_NAMES = ('LOD LOW', 'LOD MEDIUM', 'LOD HIGH')
+CACHE_MAGIC = b'MMSH'
+CACHE_VER = 5
+CACHE_HEAD = '<HHIIId'
+CACHE_HLEN = len(CACHE_MAGIC) + struct.calcsize(CACHE_HEAD)
+SHADOW_BANDS = 14
+
+
+def load_stl(path):
+    """Read binary or ASCII STL into a flat list of 12-float tuples
+    (nx, ny, nz, then three vertices). The stored facet normal is kept: it is
+    the only record of the original surface once the geometry is decimated,
+    and it is what tells a clustered triangle which way round it should face."""
+    d = open(path, 'rb').read()
+    if len(d) < 84:
+        raise ValueError('%s: too short to be an STL' % path)
+    n = struct.unpack('<I', d[80:84])[0]
+    if len(d) == 84 + 50 * n:
+        return [r[:12] for r in struct.iter_unpack('<12fH', d[84:84 + 50 * n])]
+    # ASCII: the header check has to be the size arithmetic above, not the
+    # leading word. Plenty of binary STLs in the wild start with "solid".
+    txt = d.decode('utf-8', 'replace')
+    if 'facet' not in txt:
+        raise ValueError('%s: not a recognisable STL' % path)
+    out = []
+    nrm = (0.0, 0.0, 1.0)
+    vs = []
+    for line in txt.splitlines():
+        w = line.split()
+        if not w:
+            continue
+        if w[0] == 'facet' and len(w) >= 5:
+            nrm = (float(w[2]), float(w[3]), float(w[4]))
+            vs = []
+        elif w[0] == 'vertex' and len(w) >= 4:
+            vs.append((float(w[1]), float(w[2]), float(w[3])))
+        elif w[0] == 'endfacet' and len(vs) == 3:
+            out.append(nrm + vs[0] + vs[1] + vs[2])
+    if not out:
+        raise ValueError('%s: no facets found' % path)
+    return out
+
+
+def stl_bounds(tris):
+    x0 = y0 = z0 = 1e30
+    x1 = y1 = z1 = -1e30
+    for t in tris:
+        for k in (3, 6, 9):
+            a, b, c = t[k], t[k + 1], t[k + 2]
+            if a < x0: x0 = a
+            if a > x1: x1 = a
+            if b < y0: y0 = b
+            if b > y1: y1 = b
+            if c < z0: z0 = c
+            if c > z1: z1 = c
+    return (x0, y0, z0, x1, y1, z1)
+
+
+def analyse_stl(tris):
+    """Facts about the source mesh, for the panel. Welds at a tolerance
+    relative to the diagonal, then checks that every edge is used exactly twice
+    -- which is what 'watertight' means and what makes the enclosed volume a
+    real number rather than a hopeful one."""
+    x0, y0, z0, x1, y1, z1 = stl_bounds(tris)
+    diag = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
+    inv = 1.0 / max(diag * 1e-6, 1e-12)
+    vid = {}
+    idx = []
+    for t in tris:
+        tri = []
+        for k in (3, 6, 9):
+            key = (int(t[k] * inv), int(t[k + 1] * inv), int(t[k + 2] * inv))
+            i = vid.get(key)
+            if i is None:
+                i = len(vid)
+                vid[key] = i
+            tri.append(i)
+        idx.append(tri)
+    edges = {}
+    for a, b, c in idx:
+        for u, v in ((a, b), (b, c), (c, a)):
+            e = (u, v) if u < v else (v, u)
+            edges[e] = edges.get(e, 0) + 1
+    manifold = all(v == 2 for v in edges.values())
+    vol = area = 0.0
+    for t in tris:
+        ax, ay, az = t[3], t[4], t[5]
+        bx, by, bz = t[6], t[7], t[8]
+        cx, cy, cz = t[9], t[10], t[11]
+        vol += (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
+                + az * (bx * cy - by * cx))
+        ux, uy, uz = bx - ax, by - ay, bz - az
+        vx, vy, vz = cx - ax, cy - ay, cz - az
+        mx = uy * vz - uz * vy
+        my = uz * vx - ux * vz
+        mz = ux * vy - uy * vx
+        area += math.sqrt(mx * mx + my * my + mz * mz)
+    return {
+        'src_tris': len(tris), 'src_verts': len(vid), 'edges': len(edges),
+        'watertight': manifold,
+        'bbox': (x1 - x0, y1 - y0, z1 - z0),
+        'volume': abs(vol) / 6.0, 'area': area / 2.0,
+    }
+
+
+def cluster_decimate(tris, ncell):
+    """Vertex clustering: snap every corner to a grid cell, keep one
+    representative per cell, drop triangles whose corners collapse together.
+
+    Clustering rather than quadric edge collapse because this is O(n) in one
+    pass where the collapse is a priority queue over 364,000 edges and minutes
+    of Python. Measured against the source at the shipped LODs, the enclosed
+    volume moves by under 1% and the surface area by under 2%, which for a
+    150-pixel-tall render is far below anything visible.
+    """
+    x0, y0, z0, x1, y1, z1 = stl_bounds(tris)
+    ext = max(x1 - x0, y1 - y0, z1 - z0) or 1.0
+    s = ncell / ext
+    nx = int((x1 - x0) * s) + 2
+    ny = int((y1 - y0) * s) + 2
+
+    # The representative is the area-weighted mean of the corners that landed
+    # in the cell, not the cell centre. The centre quantises every surface onto
+    # a lattice and the model comes out visibly stair-stepped; the mean leaves
+    # flat panels flat and keeps long straight edges straight.
+    acc = {}
+    keys = []
+    for t in tris:
+        ux, uy, uz = t[6] - t[3], t[7] - t[4], t[8] - t[5]
+        vx, vy, vz = t[9] - t[3], t[10] - t[4], t[11] - t[5]
+        cx = uy * vz - uz * vy
+        cy = uz * vx - ux * vz
+        cz = ux * vy - uy * vx
+        w = math.sqrt(cx * cx + cy * cy + cz * cz) * 0.5 + 1e-9
+        tk = []
+        for k in (3, 6, 9):
+            key = ((int((t[k + 2] - z0) * s) * ny
+                    + int((t[k + 1] - y0) * s)) * nx + int((t[k] - x0) * s))
+            a = acc.get(key)
+            if a is None:
+                acc[key] = [t[k] * w, t[k + 1] * w, t[k + 2] * w, w]
+            else:
+                a[0] += t[k] * w
+                a[1] += t[k + 1] * w
+                a[2] += t[k + 2] * w
+                a[3] += w
+            tk.append(key)
+        keys.append((tk[0], tk[1], tk[2], cx, cy, cz))
+
+    order = {}
+    verts = []
+    for key, a in acc.items():
+        order[key] = len(verts)
+        verts.append((a[0] / a[3], a[1] / a[3], a[2] / a[3]))
+
+    seen = set()
+    faces = []
+    for a, b, c, fnx, fny, fnz in keys:
+        if a == b or b == c or a == c:
+            continue                       # collapsed to an edge or a point
+        ia, ib, ic = order[a], order[b], order[c]
+        # canonical rotation: kills exact duplicates without touching winding
+        if ia <= ib and ia <= ic:
+            k = (ia, ib, ic)
+        elif ib <= ia and ib <= ic:
+            k = (ib, ic, ia)
+        else:
+            k = (ic, ia, ib)
+        if k in seen:
+            continue
+        seen.add(k)
+        # Re-orient against the original facet normal. Clustering can reverse a
+        # winding, and on a backface-culled render a reversed facet is a hole
+        # you can see straight through the model.
+        pa, pb, pc = verts[ia], verts[ib], verts[ic]
+        ux, uy, uz = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+        vx, vy, vz = pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]
+        mx = uy * vz - uz * vy
+        my = uz * vx - ux * vz
+        mz = ux * vy - uy * vx
+        faces.append((ia, ib, ic) if mx * fnx + my * fny + mz * fnz >= 0
+                     else (ia, ic, ib))
+    return verts, faces
+
+
+def decimate_to(tris, target, tol=0.06, probes=5):
+    """Find the grid resolution that lands nearest `target` faces.
+
+    Not a binary search. Face count over a surface grows as the *square* of the
+    grid resolution, so one probe predicts the answer: n' = n * sqrt(target/f).
+    That converges in two or three passes where bisecting the range took nine,
+    and each pass is a full clustering of a quarter-million triangles. Keeps
+    the best seen rather than the last, since the count is only monotone in the
+    grid size, not smooth in it.
+    """
+    n = 40
+    best = None
+    for _ in range(probes):
+        v, f = cluster_decimate(tris, n)
+        cnt = len(f)
+        if best is None or abs(cnt - target) < abs(best[2] - target):
+            best = (v, f, cnt, n)
+        if abs(cnt - target) <= tol * target:
+            break
+        nn = int(round(n * math.sqrt(target / float(max(cnt, 1)))))
+        nn = max(4, min(400, nn))
+        if nn == n:
+            nn = n + (1 if cnt < target else -1)
+        n = nn
+    return best[0], best[1], best[3]
+
+
+def voxel_solid(tris, res, density=1.5, want_volume=None):
+    """Burn the dense mesh into an occupancy grid, flood the outside, and call
+    everything unreached solid.
+
+    The sampling lattice on each triangle is sized from its LONGEST EDGE, not
+    its area. Sizing from area leaks: an STL like this is full of slivers --
+    triangles whose area is near zero but whose edges run across a dozen voxels
+    -- and those get three samples, leave their span unmarked, and let the
+    outside flood walk straight into the interior. The failure is silent: the
+    grid still looks like a model, 'solid' just quietly comes to mean 'shell',
+    and occlusion stops seeing anything it should. Caught by checking the
+    interior voxel count against the enclosed volume, which is the sort of
+    cross-check worth building in.
+    """
+    x0, y0, z0, x1, y1, z1 = stl_bounds(tris)
+    ext = max(x1 - x0, y1 - y0, z1 - z0) or 1.0
+    s = res / ext
+    nx = int((x1 - x0) * s) + 3
+    ny = int((y1 - y0) * s) + 3
+    nz = int((z1 - z0) * s) + 3
+    cell = ext / res
+    ox, oy, oz = x0 - cell, y0 - cell, z0 - cell
+    grid = bytearray(nx * ny * nz)
+    for t in tris:
+        ax, ay, az = t[3], t[4], t[5]
+        ux, uy, uz = t[6] - ax, t[7] - ay, t[8] - az
+        vx, vy, vz = t[9] - ax, t[10] - ay, t[11] - az
+        wx, wy, wz = vx - ux, vy - uy, vz - uz
+        e2 = max(ux * ux + uy * uy + uz * uz,
+                 vx * vx + vy * vy + vz * vz,
+                 wx * wx + wy * wy + wz * wz)
+        m = int(math.sqrt(e2) * density * s) + 1
+        for ia in range(m + 1):
+            fa = ia / m
+            for ib in range(m + 1 - ia):
+                fb = ib / m
+                i = int((ax + ux * fa + vx * fb - ox) * s)
+                j = int((ay + uy * fa + vy * fb - oy) * s)
+                k = int((az + uz * fa + vz * fb - oz) * s)
+                grid[(k * ny + j) * nx + i] = 1
+    shell = sum(grid)
+
+    nxy = nx * ny
+    total = nxy * nz
+    out = bytearray(total)
+    q = deque()
+
+    def seed(p):
+        if not grid[p] and not out[p]:
+            out[p] = 1
+            q.append(p)
+
+    for j in range(ny):
+        for i in range(nx):
+            seed((0 * ny + j) * nx + i)
+            seed(((nz - 1) * ny + j) * nx + i)
+    for k in range(nz):
+        for i in range(nx):
+            seed((k * ny + 0) * nx + i)
+            seed((k * ny + ny - 1) * nx + i)
+        for j in range(ny):
+            seed((k * ny + j) * nx + 0)
+            seed((k * ny + j) * nx + nx - 1)
+    while q:
+        p = q.popleft()
+        k, rem = divmod(p, nxy)
+        j, i = divmod(rem, nx)
+        if i > 0:
+            seed(p - 1)
+        if i < nx - 1:
+            seed(p + 1)
+        if j > 0:
+            seed(p - nx)
+        if j < ny - 1:
+            seed(p + nx)
+        if k > 0:
+            seed(p - nxy)
+        if k < nz - 1:
+            seed(p + nxy)
+    solid = bytearray(total)
+    for p in range(total):
+        if not out[p]:
+            solid[p] = 1
+    nsolid = sum(solid)
+    # Cross-check, because the leak this function is written to avoid is
+    # *silent*: a leaked grid still looks like a model, it just stops having an
+    # inside. The mesh's own enclosed volume says how many cells should be
+    # solid; a conservative voxelisation overshoots that by about half a cell
+    # of thickness over the whole surface, and never undershoots. Coming in
+    # low means the flood got in.
+    ok = True
+    if want_volume:
+        expect = want_volume * s ** 3
+        ok = nsolid >= expect * 0.92
+    return solid, (nx, ny, nz), (ox, oy, oz), s, shell, nsolid, ok
+
+
+def hemi_dirs(nx, ny, nz):
+    """Thirteen directions in the hemisphere about a normal: the axis plus two
+    rings. Fixed rather than randomised, so a face gets the same answer every
+    run and the cached occlusion means something."""
+    ux, uy, uz = (0.0, 0.0, 1.0) if abs(nz) < 0.9 else (1.0, 0.0, 0.0)
+    ax = uy * nz - uz * ny
+    ay = uz * nx - ux * nz
+    az = ux * ny - uy * nx
+    al = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+    ax, ay, az = ax / al, ay / al, az / al
+    bx = ny * az - nz * ay
+    by = nz * ax - nx * az
+    bz = nx * ay - ny * ax
+    dirs = [(nx, ny, nz)]
+    for rad, cnt, ph in ((0.55, 6, 0.0), (0.90, 6, 0.4)):
+        ct = math.sqrt(1.0 - rad * rad)
+        for i in range(cnt):
+            th = 2 * math.pi * i / cnt + ph
+            c, sn = math.cos(th) * rad, math.sin(th) * rad
+            dirs.append((nx * ct + ax * c + bx * sn,
+                         ny * ct + ay * c + by * sn,
+                         nz * ct + az * c + bz * sn))
+    return dirs
+
+
+def face_ao(verts, faces, solid, dims, org, s, radius_cells=4.0, steps=3):
+    """Per-face occlusion: fire the hemisphere, march each ray out to the
+    radius, and count the ones that end up inside solid. This is occlusion in
+    the real sense -- it sees the arm hanging in front of the chest, which a
+    curvature estimate never can, and that is the whole reason for the grid."""
+    nxg, nyg, nzg = dims
+    ox, oy, oz = org
+    inv = 1.0 / s
+    out = []
+    for ia, ib, ic in faces:
+        pa, pb, pc = verts[ia], verts[ib], verts[ic]
+        cx = (pa[0] + pb[0] + pc[0]) / 3.0
+        cy = (pa[1] + pb[1] + pc[1]) / 3.0
+        cz = (pa[2] + pb[2] + pc[2]) / 3.0
+        ux, uy, uz = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+        vx, vy, vz = pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]
+        mx = uy * vz - uz * vy
+        my = uz * vx - ux * vz
+        mz = ux * vy - uy * vx
+        ml = math.sqrt(mx * mx + my * my + mz * mz) or 1.0
+        dirs = hemi_dirs(mx / ml, my / ml, mz / ml)
+        hit = 0
+        for dx, dy, dz in dirs:
+            for st in range(1, steps + 1):
+                r = radius_cells * st / steps * inv
+                i = int((cx + dx * r - ox) * s)
+                j = int((cy + dy * r - oy) * s)
+                k = int((cz + dz * r - oz) * s)
+                if 0 <= i < nxg and 0 <= j < nyg and 0 <= k < nzg \
+                        and solid[(k * nyg + j) * nxg + i]:
+                    hit += 1
+                    break              # blocked: the rest of this ray is moot
+        out.append(1.0 - hit / float(len(dirs)))
+    return out
+
+
+def shadow_bands(verts, nbands=SHADOW_BANDS):
+    """Ground shadow as a stack of height bands, each hulled separately.
+
+    One hull over the whole model is a blob that loses the gap between the
+    legs. Banding by height keeps the legs apart and the arms distinct for
+    almost nothing, and because the model is static under an orbiting camera --
+    the turntable moves the eye, not the mech -- the whole thing is computed
+    once at load and only projected at frame time.
+    """
+    if not verts or SUN[2] <= 0.05:
+        return []
+    z0 = min(v[2] for v in verts)
+    z1 = max(v[2] for v in verts)
+    span = (z1 - z0) or 1.0
+    buckets = [[] for _ in range(nbands)]
+    for x, y, z in verts:
+        b = int((z - z0) / span * nbands)
+        if b >= nbands:
+            b = nbands - 1
+        t = z / SUN[2]
+        buckets[b].append((x - SUN[0] * t, y - SUN[1] * t))
+    out = []
+    for b in buckets:
+        h = hull2d(b)
+        if len(h) >= 3:
+            out.append(h)
+    return out
+
+
+class _MeshView:
+    """Just enough of Mesh's shape for Part to consume an indexed triangle
+    soup. The loft builders and the STL loader produce the same two fields, so
+    Part does not need to know which it is looking at."""
+
+    __slots__ = ('v', 'f')
+
+    def __init__(self, verts, faces, mat):
+        self.v = verts
+        self.f = [(f, mat) for f in faces]
+
+
+def print_mesh_report(src, lods):
+    print('SOURCE')
+    print('  facets        %14s' % commas(src['src_tris']))
+    print('  vertices      %14s   (welded)' % commas(src['src_verts']))
+    print('  edges         %14s' % commas(src['edges']))
+    print('  watertight    %14s   %s' % (
+        'yes' if src['watertight'] else 'no',
+        'every edge used exactly twice' if src['watertight']
+        else 'enclosed volume is not meaningful'))
+    # json round-trips a tuple as a list, so the cached report needs coercing
+    print('  bounding box  %6.1f x %.1f x %.1f  source units'
+          % tuple(src['bbox']))
+    print('  volume        %14.1f   cubic source units' % src['volume'])
+    print('  surface area  %14.1f   square source units' % src['area'])
+    print('  occupancy     %14s   solid cells, %s on the shell'
+          % (commas(src['solid_cells']), commas(src['shell_cells'])))
+    print('  sealed        %14s   %s' % (
+        'yes' if src.get('sealed') else 'NO',
+        'interior matches the enclosed volume' if src.get('sealed')
+        else 'the flood leaked: occlusion will be wrong'))
+    print()
+    print('AS BUILT   normalised to %.1f m tall, %.4f m per source unit'
+          % (MODEL_H, src['scale']))
+    print('  volume        %14.1f   m3' % src['built_volume'])
+    print('  mass          %14.1f   t at %.2f t/m3'
+          % (src['built_mass'], DENSITY['plate']))
+    print()
+    print('%-8s %8s %8s %6s %10s %10s' %
+          ('LEVEL', 'FACETS', 'VERTS', 'GRID', 'VOL ERR', 'AREA ERR'))
+    for i, r in enumerate(lods):
+        print('%-8s %8s %8s %6d %9.2f%% %9.2f%%'
+              % (LOD_NAMES[i] if i < len(LOD_NAMES) else 'LOD %d' % i,
+                 commas(r['faces']), commas(r['verts']), r['grid'],
+                 r['vol_err'], r['area_err']))
+    print()
+    print('Reduction to %s facets is %.2f%% of the source. Errors are against'
+          % (commas(lods[len(lods) // 2]['faces']),
+             lods[len(lods) // 2]['faces'] / float(src['src_tris']) * 100.0))
+    print('the source mesh, measured, not estimated.')
+
+
+class Model:
+    """A loaded, decimated, occluded mesh at one level of detail, normalised so
+    it stands MODEL_H tall on z = 0 and centred on the vertical axis."""
+
+    __slots__ = ('verts', 'faces', 'ao', 'report', 'shadow')
+
+    def __init__(self, verts, faces, ao, report):
+        self.verts = verts
+        self.faces = faces
+        self.ao = ao
+        self.report = report
+        self.shadow = shadow_bands(verts)
+
+
+def normalise(verts, up='z'):
+    """Stand the model on the ground, centre it on the vertical axis, scale it
+    to MODEL_H. Returns the vertices and the metres-per-source-unit factor,
+    which is what lets the panel quote a real-world volume for a mesh whose own
+    units are millimetres of printed plastic."""
+    if up == 'y':
+        verts = [(v[0], -v[2], v[1]) for v in verts]
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    z0 = min(zs)
+    k = MODEL_H / ((max(zs) - z0) or 1.0)
+    return [((v[0] - cx) * k, (v[1] - cy) * k, (v[2] - z0) * k)
+            for v in verts], k
+
+
+def build_model(tris, src, target, up, ao_radius, grid, note=None):
+    """Decimate, occlude, normalise. Occlusion is measured in the source mesh's
+    own coordinates -- the voxel grid is built from the source triangles, and
+    the decimated vertices have not been moved yet -- so the two never have to
+    agree on a transform."""
+    solid, dims, org, s, shell, sol, sealed, vox = grid
+    if note:
+        note('decimating %s facets to %s' % (commas(len(tris)), commas(target)))
+    verts, faces, ncell = decimate_to(tris, target)
+    if note:
+        note('occluding %s facets' % commas(len(faces)))
+    ao = face_ao(verts, faces, solid, dims, org, s, ao_radius)
+    # Normalise against the mesh's own open-sky value rather than against 1.0.
+    # Theory says an unoccluded facet sees the whole hemisphere, but a facet on
+    # a real machine is surrounded by panel gaps, bolt heads and its own
+    # neighbours, so the raw mean here is 0.35 and shading straight off it
+    # drags the entire model into shadow. The 85th percentile is what this
+    # surface actually achieves when nothing is in the way; that is the number
+    # worth calling 'open'.
+    ref = sorted(ao)[int(len(ao) * 0.85)] if ao else 1.0
+    if ref > 1e-3:
+        ao = [min(1.0, a / ref) for a in ao]
+    verts, scale = normalise(verts, up)
+
+    # Decimated volume and area, for the reduction report.
+    dvol = darea = 0.0
+    for ia, ib, ic in faces:
+        pa, pb, pc = verts[ia], verts[ib], verts[ic]
+        dvol += (pa[0] * (pb[1] * pc[2] - pb[2] * pc[1])
+                 - pa[1] * (pb[0] * pc[2] - pb[2] * pc[0])
+                 + pa[2] * (pb[0] * pc[1] - pb[1] * pc[0]))
+        ux, uy, uz = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+        vx, vy, vz = pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]
+        mx = uy * vz - uz * vy
+        my = uz * vx - ux * vz
+        mz = ux * vy - uy * vx
+        darea += math.sqrt(mx * mx + my * my + mz * mz)
+    dvol = abs(dvol) / 6.0
+    darea /= 2.0
+
+    report = dict(src)
+    report.update({
+        'faces': len(faces), 'verts': len(verts), 'grid': ncell,
+        'target': target, 'vox': vox, 'ao_radius': ao_radius,
+        'shell_cells': shell, 'solid_cells': sol, 'sealed': sealed,
+        'scale': scale, 'up': up,
+        # Volume as built: the source mesh is millimetres of printed plastic,
+        # so scale it to the height the renderer stands it at and the number
+        # becomes a real displacement in cubic metres -- and, at the plate
+        # density the built-in model is calibrated to, a real tonnage.
+        # As-built figures come from the SOURCE volume scaled up, not from the
+        # decimated hull: the source is the truth and the decimation is an
+        # approximation of it, so quoting the approximation would make the
+        # displacement of the machine change every time you press d.
+        'built_volume': src['volume'] * scale ** 3,
+        'built_area': src['area'] * scale ** 2,
+        'built_mass': src['volume'] * scale ** 3 * DENSITY['plate'],
+        'lod_volume': dvol, 'lod_area': darea,
+        'vol_err': (dvol / (src['volume'] * scale ** 3) - 1.0) * 100.0
+                   if src.get('volume') else 0.0,
+        'area_err': (darea / (src['area'] * scale ** 2) - 1.0) * 100.0
+                    if src.get('area') else 0.0,
+    })
+    return Model(verts, faces, ao, report)
+
+
+def _cache_path(path, target, up, ao_radius, vox):
+    st = os.stat(path)
+    return '%s.%d-%d-%s-%g-%d.mmesh' % (path, target, st.st_size, up,
+                                        ao_radius, vox)
+
+
+def _cache_read(cp, mtime):
+    try:
+        d = open(cp, 'rb').read()
+    except OSError:
+        return None
+    try:
+        if len(d) < CACHE_HLEN or d[:len(CACHE_MAGIC)] != CACHE_MAGIC:
+            return None
+        ver, order, jlen, nv, nf, mt = struct.unpack(
+            CACHE_HEAD, d[len(CACHE_MAGIC):CACHE_HLEN])
+        if ver != CACHE_VER or order != (sys.byteorder != 'little'):
+            return None
+        if abs(mt - mtime) > 1e-6:
+            return None
+        o = CACHE_HLEN
+        report = json.loads(d[o:o + jlen].decode('utf-8'))
+        o += jlen
+        va = array.array('f')
+        va.frombytes(d[o:o + nv * 12])
+        o += nv * 12
+        fa = array.array('i')
+        fa.frombytes(d[o:o + nf * 12])
+        o += nf * 12
+        aa = array.array('f')
+        aa.frombytes(d[o:o + nf * 4])
+        if len(va) != nv * 3 or len(fa) != nf * 3 or len(aa) != nf:
+            return None
+    except Exception:
+        return None       # a truncated or foreign cache just means rebuild
+    verts = [(va[i * 3], va[i * 3 + 1], va[i * 3 + 2]) for i in range(nv)]
+    faces = [(fa[i * 3], fa[i * 3 + 1], fa[i * 3 + 2]) for i in range(nf)]
+    return Model(verts, faces, list(aa), report)
+
+
+def _cache_write(cp, m, mtime):
+    j = json.dumps(m.report).encode('utf-8')
+    head = CACHE_MAGIC + struct.pack(
+        CACHE_HEAD, CACHE_VER, sys.byteorder != 'little',
+        len(j), len(m.verts), len(m.faces), mtime)
+    try:
+        tmp = '%s.%d.tmp' % (cp, os.getpid())
+        with open(tmp, 'wb') as fh:
+            fh.write(head)
+            fh.write(j)
+            fh.write(array.array('f', [c for v in m.verts for c in v]).tobytes())
+            fh.write(array.array('i', [c for f in m.faces for c in f]).tobytes())
+            fh.write(array.array('f', m.ao).tobytes())
+        os.replace(tmp, cp)
+    except OSError:
+        pass          # a read-only directory is no reason to fail to draw
+
+
+def load_models(path, targets, up='z', ao_radius=4.0, vox=80, note=None,
+                use_cache=True):
+    """Every level of detail, from cache where possible.
+
+    Building all three up front costs a few seconds once; building them lazily
+    would put that pause in the middle of a keypress instead, which is worse.
+    After the first run it is a file read.
+    """
+    mtime = os.stat(path).st_mtime
+    out = []
+    tris = None
+    src = None
+    grid = None
+    for t in targets:
+        cp = _cache_path(path, t, up, ao_radius, vox)
+        m = _cache_read(cp, mtime) if use_cache else None
+        if m is None:
+            if tris is None:
+                if note:
+                    note('reading %s' % os.path.basename(path))
+                tris = load_stl(path)
+                if note:
+                    note('analysing %s facets' % commas(len(tris)))
+                src = analyse_stl(tris)
+            if grid is None:
+                # Once, not once per level: the occupancy grid depends only on
+                # the source mesh, and rebuilding it per LOD was three
+                # identical four-second passes.
+                if note:
+                    note('voxelising at %d^3' % vox)
+                grid = voxel_solid(tris, vox, want_volume=src['volume']) + (vox,)
+            m = build_model(tris, src, t, up, ao_radius, grid, note)
+            if use_cache:
+                _cache_write(cp, m, mtime)
+        out.append(m)
+    return out
 
 
 # --- the mech -------------------------------------------------------------
@@ -977,20 +1678,43 @@ HELP = [
     'SPACE  pause the turntable      q      quit',
     '<- ->  orbit                    ^ v    tilt',
     '[ ]    zoom                     , .    spin rate',
-    'j k    select a part            0      reset the view',
-    'e      exploded view            w      wireframe',
-    'l      part labels              g      grid: solid / x-ray / off',
+    'd      detail: low / med / high a      ambient occlusion',
+    'w      wireframe                l      labels',
+    'j k    select a part            e      exploded view',
+    'g      grid: solid / x-ray/ off i      idle animation',
     'p      cycle palette            1-6    palette direct',
     's      starfield                z      zen (hide the HUD)',
-    'i      idle animation           h      this help',
+    '0      reset the view           h      this help',
     '',
-    'Mass is the divergence-theorem volume of each hull times the',
-    'density of its material. It is measured, not typed in.',
+    'On a loaded mesh, j k e and i are inert: it is a single',
+    'watertight shell with no joints and no parts to separate.',
+    '',
+    'Everything in the panel is measured off the mesh -- the',
+    'decimation error against the source, the enclosed volume,',
+    'the mass at 12 m. None of it is typed in.',
 ]
 
 
 def main():
     ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('model', nargs='?', default=None,
+                    help='an STL to load; defaults to mc.stl beside this '
+                         'script if it is there, else the built-in model')
+    ap.add_argument('--builtin', action='store_true',
+                    help='the procedural mech, ignoring any STL')
+    ap.add_argument('--up', default='z', choices=('z', 'y'),
+                    help="which axis the STL calls up (default z)")
+    ap.add_argument('--faces', type=int, default=None,
+                    help='facet budget; overrides the three built-in levels')
+    ap.add_argument('--lod', type=int, default=1, choices=(0, 1, 2),
+                    help='starting detail level, 0 low .. 2 high')
+    ap.add_argument('--ao-radius', type=float, default=4.0,
+                    help='occlusion reach, in voxels')
+    ap.add_argument('--voxels', type=int, default=80,
+                    help='occupancy grid resolution on the longest axis')
+    ap.add_argument('--no-ao', action='store_true')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='rebuild the mesh cache instead of reading it')
     ap.add_argument('--palette', default='field', choices=PAL_NAMES)
     ap.add_argument('--fps', type=float, default=30.0)
     ap.add_argument('--speed', type=float, default=1.0)
@@ -1012,19 +1736,63 @@ def main():
         print(__doc__)
         return
 
+    # ---- pick a model ----
+    stl_path = args.model
+    if stl_path is None and not args.builtin:
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'mc.stl')
+        if os.path.exists(here):
+            stl_path = here
+    if args.builtin:
+        stl_path = None
+    if stl_path is not None and not os.path.exists(stl_path):
+        print('no such file: %s' % stl_path, file=sys.stderr)
+        return 2
+
+    lods = []
     frames_d, forder, parts = build_mech()
+    if stl_path is not None:
+        targets = (args.faces,) if args.faces else LOD_TARGETS
+        # Building is seconds on a cold cache and milliseconds on a warm one,
+        # so say what is happening rather than show a black terminal.
+        def note(msg):
+            sys.stdout.write('  %s ...\r\n' % msg)
+            sys.stdout.flush()
+        try:
+            models = load_models(stl_path, targets, up=args.up,
+                                 ao_radius=args.ao_radius, vox=args.voxels,
+                                 note=note, use_cache=not args.no_cache)
+        except (OSError, ValueError, struct.error) as e:
+            print('cannot load %s: %s' % (stl_path, e), file=sys.stderr)
+            return 2
+        frames_d, forder = {}, []
+        root = Frame('root', None, (0.0, 0.0, 0.0), IDENT)
+        frames_d['root'] = root
+        forder.append(root)
+        for i, m in enumerate(models):
+            mv = _MeshView(m.verts, m.faces, 'plate')
+            lods.append(Part(os.path.basename(stl_path), root, mv, 'hull',
+                             trust_winding=True,
+                             ao=None if args.no_ao else m.ao, wear_amp=0.055))
+            lods[-1].model = m
+        lod = min(args.lod, len(lods) - 1)
+        parts = [lods[lod]]
 
     if args.stats:
-        print('%-18s %-8s %8s %8s %7s' % ('PART', 'GROUP', 'VOL m3', 'MASS t',
-                                          'FACES'))
-        tot = vol = nf = 0.0
-        for p in parts:
-            print('%-18s %-8s %8.2f %8.2f %7d'
-                  % (p.name, p.group, p.volume, p.mass, len(p.faces)))
-            tot += p.mass
-            vol += p.volume
-            nf += len(p.faces)
-        print('%-18s %-8s %8.2f %8.2f %7d' % ('TOTAL', '', vol, tot, nf))
+        if lods:
+            print_mesh_report(lods[0].model.report,
+                              [p.model.report for p in lods])
+        else:
+            print('%-18s %-8s %8s %8s %7s'
+                  % ('PART', 'GROUP', 'VOL m3', 'MASS t', 'FACES'))
+            tot = vol = nf = 0.0
+            for p in parts:
+                print('%-18s %-8s %8.2f %8.2f %7d'
+                      % (p.name, p.group, p.volume, p.mass, len(p.faces)))
+                tot += p.mass
+                vol += p.volume
+                nf += len(p.faces)
+            print('%-18s %-8s %8.2f %8.2f %7d' % ('TOTAL', '', vol, tot, nf))
         return
 
     SUBX = 2 if args.blocks == 'quad' else 1
@@ -1101,7 +1869,10 @@ def main():
     for f in forder:
         f.resolve()
     allw = []
-    for p in parts:
+    # Every level of detail, not just the one showing: the levels differ by a
+    # fraction of a unit at the silhouette, and framing that tracked the
+    # current level would make the model jump when d cycles.
+    for p in (lods or parts):
         M, T = p.frame.M, p.frame.T
         for v in p.v:
             q = mvec(M, v)
@@ -1111,7 +1882,10 @@ def main():
     MZ1 = max(w[2] for w in allw)
     MCZ = (MZ0 + MZ1) / 2.0
     # Rest-pose direction of each part from the model's axis, for the explode.
-    for p in parts:
+    # Over every level of detail, not just the one showing: d swaps which Part
+    # is in `parts`, and a level that never got here crashes the frame loop the
+    # moment it is selected. Found by the key soak, not by looking.
+    for p in (lods or parts):
         M, T = p.frame.M, p.frame.T
         c = mvec(M, p.centroid)
         c = (c[0] + T[0], c[1] + T[1], c[2] + T[2])
@@ -1119,12 +1893,10 @@ def main():
 
     FIT_RING = [(math.cos(a * math.pi / 8), math.sin(a * math.pi / 8))
                 for a in range(16)]
-    # Two lights and a sky, which is the smallest rig that keeps a shadowed
-    # flank from going flat black. SUN is the key; FILL is a dim, roughly
-    # opposite source standing in for everything the sky and the ground bounce
-    # back sideways.
-    SUN = normed((0.52, -0.66, 0.54))          # direction *toward* the sun
-    FILL = normed((-0.62, 0.48, 0.18))
+    stl_mode = bool(lods)
+    lod_i = min(args.lod, len(lods) - 1) if stl_mode else 0
+    ao_on = not args.no_ao
+    model_name = stl_path if stl_mode else 'MADCAT-X'
 
     rng = random.Random(7)
     stars = []
@@ -1185,14 +1957,32 @@ def main():
                 elif k == '.':
                     spin = min(6.0, spin + 0.25)
                     flash, flash_until = f'SPIN {spin:+.2f}', now + 0.8
-                elif k in ('j', '\t'):
-                    sel = (sel + 1) % len(parts)
-                elif k == 'k':
-                    sel = (sel - 1) % len(parts)
+                elif k in ('j', '\t', 'k'):
+                    # A loaded mesh is one shell -- the source is watertight and
+                    # vertex-connected throughout -- so there is nothing to
+                    # select between, and per the mode law the key goes
+                    # silently inert rather than explaining itself.
+                    if not stl_mode:
+                        sel = (sel + (1 if k != 'k' else -1)) % len(parts)
                 elif k == 'e':
-                    explode_t = 0.0 if explode_t > 0.5 else 1.0
-                    flash, flash_until = ('EXPLODED' if explode_t else
-                                          'ASSEMBLED', now + 0.9)
+                    if not stl_mode:
+                        explode_t = 0.0 if explode_t > 0.5 else 1.0
+                        flash, flash_until = ('EXPLODED' if explode_t else
+                                              'ASSEMBLED', now + 0.9)
+                elif k == 'd':
+                    if stl_mode and len(lods) > 1:
+                        lod_i = (lod_i + 1) % len(lods)
+                        parts = [lods[lod_i]]
+                        sel = 0
+                        flash, flash_until = (
+                            '%s  %s FACETS'
+                            % (LOD_NAMES[lod_i] if lod_i < len(LOD_NAMES)
+                               else 'LOD %d' % lod_i,
+                               commas(len(parts[0].faces))), now + 1.1)
+                elif k == 'a':
+                    ao_on = not ao_on
+                    flash, flash_until = ('OCCLUSION ON' if ao_on
+                                          else 'OCCLUSION OFF', now + 0.9)
                 elif k == 'w':
                     wire = not wire
                     flash, flash_until = ('WIREFRAME' if wire else 'SOLID',
@@ -1205,9 +1995,12 @@ def main():
                 elif k == 's':
                     stars_on = not stars_on
                 elif k == 'i':
-                    idle_on = not idle_on
-                    flash, flash_until = ('IDLE ON' if idle_on else 'IDLE OFF',
-                                          now + 0.8)
+                    # Idle is a pose on the built-in skeleton. A loaded mesh is
+                    # one rigid body with no joints to move, so: silently inert.
+                    if not stl_mode:
+                        idle_on = not idle_on
+                        flash, flash_until = ('IDLE ON' if idle_on
+                                              else 'IDLE OFF', now + 0.8)
                 elif k == 'z':
                     zen = not zen
                 elif k in ('h', '?'):
@@ -1221,8 +2014,9 @@ def main():
                     P, MAT = PALETTES[pal], palette_materials(pal)
                     flash, flash_until = pal.upper(), now + 0.9
                 elif k == '0':
-                    az, el, zoom, spin = (math.radians(args.az), math.radians(args.tilt),
-                                         1.0, args.speed)
+                    az, el, zoom, spin = (math.radians(args.az),
+                                          math.radians(args.tilt),
+                                          1.0, args.speed)
                     DIST, explode_t, wire = args.dist, 0.0, False
                     grid_mode, paused = GRID_SOLID, False
                     flash, flash_until = 'RESET', now + 0.8
@@ -1311,7 +2105,8 @@ def main():
                 draw_grid(quant(shade(P['grid'], 0.9)))
 
             # ---- pose and transform ----
-            pose_mech(frames_d, sim, idle_on)
+            if not stl_mode:
+                pose_mech(frames_d, sim, idle_on)
             for f in forder:
                 f.resolve()
 
@@ -1331,12 +2126,21 @@ def main():
                 world.append(wv)
 
             # ---- cast shadow ----
-            # Each part's bounding box, projected down the sun vector onto the
-            # ground and hulled. Eight points per part is enough for a shape
-            # that reads, and it costs a fraction of shadowing every facet.
+            # Two shapes for two kinds of model. A loaded mesh gets height
+            # bands, each hulled on the ground separately, so the gap between
+            # the legs survives -- and because the turntable moves the *eye*
+            # and not the mech, those hulls are static and were computed once
+            # at load. The built-in model is already a set of parts, so each
+            # part's own bounding box is the natural band.
             if shadow_on and SUN[2] > 0.05 and explode < 0.4:
                 shc = quant(lerp(P['ground'], P['shadow'],
                                  0.75 * (1.0 - explode / 0.4)))
+            if shadow_on and SUN[2] > 0.05 and stl_mode:
+                for band in parts[0].model.shadow:
+                    sp = [proj(bx, by, 0.01)[:2] for bx, by in band]
+                    if len(sp) >= 3:
+                        ras.fill(sp, shc)
+            elif shadow_on and SUN[2] > 0.05 and explode < 0.4:
                 for wv in world:
                     xs = [w[0] for w in wv]
                     ys = [w[1] for w in wv]
@@ -1367,7 +2171,7 @@ def main():
             # this model happens exclusively inside joints -- a bearing sunk
             # into a limb, a ram buried in a calf -- where the seam is hidden
             # by the very parts that create it.
-            sel_part = parts[sel] if parts else None
+            sel_part = parts[sel] if (parts and not stl_mode) else None
             SC = P['sel']
             fog0, fog1 = DIST - MRAD * 1.6, DIST + MRAD * 2.4
             fogc = P['sky'][1]
@@ -1376,6 +2180,9 @@ def main():
                 wv = world[pi]
                 M = p.frame.M
                 hot = p is sel_part and not zen
+                # Occlusion lives inside the per-face brightness multiplier, so
+                # toggling it is a choice of list, not a branch in the shader.
+                wr = p.wear if ao_on else p.wear_plain
                 sp = [proj(*w) for w in wv]
                 for fi, (idx, mat, ln, lc) in enumerate(p.faces):
                     n = mvec(M, ln)
@@ -1393,9 +2200,10 @@ def main():
                         pts.append((s[0], s[1]))
                         zsum += s[2]
                     zsum /= len(idx)
-                    queue.append((zsum, pts, mat, n, p.wear[fi], hot))
+                    queue.append((zsum, pts, mat, n, wr[fi], hot))
 
             queue.sort(key=lambda q: -q[0])
+            drawn = len(queue)
 
             # ---- shade and fill ----
             sky_c, bounce_c = P['sky'][1], P['bounce']
@@ -1447,20 +2255,65 @@ def main():
             if not zen:
                 total_mass = sum(p.mass for p in parts)
                 nfaces = sum(len(p.faces) for p in parts)
-                title = ' MADCAT-X // structural model '
+                title = (' %s // mesh ' % os.path.basename(model_name)
+                         if stl_mode else ' MADCAT-X // structural model ')
                 otext(0, 0, ' ' * cols, H, PN)
                 otext(0, 1, title, P['sel'], PN)
                 right = (f' {math.degrees(az) % 360:5.1f}° az '
                          f'{math.degrees(el):+5.1f}° el  d{DIST:.0f}  '
-                         f'{total_mass:.0f}t  {nfaces} facets  '
-                         f'{fps_avg:4.1f}fps ')
+                         f'{total_mass:.0f}t  {commas(nfaces)} facets  '
+                         f'{drawn} drawn  {fps_avg:4.1f}fps ')
                 otext(0, max(len(title) + 2, cols - len(right) - 1), right,
                       H, PN)
                 if flash and now < flash_until:
                     otext(1, cols - len(flash) - 3, ' ' + flash + ' ',
                           PN, P['alert'])
 
-                if panel > 4:
+                if panel > 4 and stl_mode:
+                    rp = parts[0].model.report
+                    for r in range(1, rows - 1):
+                        otext(r, 0, ' ' * panel, H, PN)
+                    otext(1, 1, 'MESH', P['sel'], PN)
+                    otext(2, 1, '─' * (panel - 2), HD, PN)
+
+                    def field(r, k, v, hot=False):
+                        otext(r, 1, k[:panel - 3], HD, PN)
+                        otext(r, max(len(k) + 2, panel - 1 - len(v)), v,
+                              P['sel'] if hot else H, PN)
+
+                    rr = 3
+                    for k, v in (
+                            ('source', commas(rp['src_tris'])),
+                            ('vertices', commas(rp['src_verts'])),
+                            ('edges', commas(rp['edges'])),
+                            ('watertight',
+                             'yes' if rp['watertight'] else 'no'),
+                            ('', ''),
+                            (LOD_NAMES[lod_i] if lod_i < len(LOD_NAMES)
+                             else 'LOD %d' % lod_i, ''),
+                            ('facets', commas(rp['faces'])),
+                            ('of source', '%.2f%%'
+                             % (rp['faces'] / float(rp['src_tris']) * 100.0)),
+                            ('vol error', '%+.2f%%' % rp['vol_err']),
+                            ('area error', '%+.2f%%' % rp['area_err']),
+                            ('', ''),
+                            ('AS BUILT', ''),
+                            ('height', '%.1f m' % MODEL_H),
+                            ('volume', '%.1f m³' % rp['built_volume']),
+                            ('mass', '%.1f t' % rp['built_mass']),
+                            ('', ''),
+                            ('occlusion', 'on' if ao_on else 'off'),
+                            ('ao reach', '%g vox' % rp['ao_radius']),
+                            ('grid', '%d³' % rp['vox']),
+                            ('solid cells', commas(rp['solid_cells'])),
+                            ('sealed', 'yes' if rp.get('sealed') else 'NO')):
+                        if rr >= rows - 2:
+                            break
+                        if k:
+                            field(rr, k, v,
+                                  hot=k in ('facets', 'occlusion'))
+                        rr += 1
+                elif panel > 4:
                     mx = max((p.mass for p in parts), default=1.0) or 1.0
                     for r in range(1, rows - 1):
                         otext(r, 0, ' ' * panel, H, PN)
@@ -1495,8 +2348,10 @@ def main():
                         otext(rows - 5, 1, '%-*s%5.1f t'
                               % (panel - 8, 'TOTAL', total_mass), H, PN)
 
-                hint = (' SPACE pause  <-> orbit  ^v tilt  [] zoom  jk part  '
-                        'e explode  p palette  h help  q quit ')
+                hint = (' SPACE pause  <-> orbit  ^v tilt  [] zoom  '
+                        + ('d detail  a occlusion  w wire  '
+                           if stl_mode else 'jk part  e explode  ')
+                        + 'p palette  h help  q quit ')
                 otext(rows - 1, 0, ' ' * cols, HD, PN)
                 otext(rows - 1, 1, hint[:cols - 2], HD, PN)
 

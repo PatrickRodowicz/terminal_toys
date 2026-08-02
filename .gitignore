@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# mesh caches: regenerated from the source STL on demand
+*.mmesh

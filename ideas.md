@@ -450,6 +450,97 @@ CSI sequences, no traceback, clean exit; 60/60 signal teardowns restoring the
 terminal; 9.4 ms/frame at 80×24 rising to 20.3 ms at 240×70, so 30 fps holds
 with room to spare.
 
+**Then it was pointed at a real mesh, and that is the version that looks good.**
+The hand-built mech was a decent exercise and a mediocre model; a 243k-triangle
+STL of the actual machine is not close. The interesting work is entirely in
+getting from 243,000 triangles to something a terminal can draw at frame rate.
+
+**The budget is screen space, not taste.** At half-block resolution the model
+covers roughly 150×400 pixels. A few thousand facets is already one facet per
+handful of pixels, so the target is not a compromise between fidelity and
+speed — past a few thousand there is nothing left to see. Measured: 6,132
+facets renders in 30 ms at 170×48.
+
+**Vertex clustering, not quadric edge collapse.** Snap every corner to a grid
+cell, keep one representative, drop triangles whose corners collapse together.
+O(n) in one pass, where the collapse is a priority queue over 364,000 edges and
+minutes of Python. Two details carry the quality:
+
+- the representative is the **area-weighted mean** of the corners that landed in
+  the cell, not the cell centre — the centre quantises every surface onto a
+  lattice and the model comes out stair-stepped, the mean leaves flat panels
+  flat;
+- every new triangle is **re-oriented against the original facet normal**,
+  which is the only reason to keep the STL's stored normals at all. Clustering
+  can reverse a winding, and on a backface-culled render a reversed facet is a
+  hole you see straight through the model.
+
+Cost, against the source: under 1% of enclosed volume and under 2% of surface
+area at the middle level. Both reported in the panel, both measured.
+
+**Search the *right* curve.** Hitting a facet budget started as a bisection over
+grid resolution: nine full clusterings of a quarter-million triangles per level.
+Face count over a surface grows as the *square* of the grid resolution, so one
+probe predicts the answer outright — `n' = n·sqrt(target/faces)` converges in
+two or three. 16.7 s of build became 7.1 s, and most of the rest was a second
+mistake: the occupancy grid, which depends only on the source, was being rebuilt
+identically once per level.
+
+**Real ambient occlusion, and it is what makes a monochrome mesh readable.**
+Under three lights a single-material mesh is a grey statue — every depth cue has
+to come from the normal, and a normal knows nothing about the arm hanging in
+front of the chest. So: burn the dense mesh into a voxel occupancy grid, flood
+the *outside*, call everything unreached solid, then fire a fixed 13-direction
+hemisphere per facet and count what lands inside. It sees other parts, not just
+local curvature. Folded into the same per-face brightness multiplier the
+weathering already used, so it costs the shader exactly nothing at frame time.
+
+Two lessons came out of it, both about being wrong quietly:
+
+- **Size a sampling lattice from the longest edge, never from the area.** The
+  first voxelisation sampled each triangle proportional to its area, and this
+  mesh — like most printable STLs — is full of *slivers*: triangles whose area
+  is near zero but whose edges run across a dozen voxels. Those got three
+  samples, left their span unmarked, and the outside flood walked straight into
+  the interior. Nothing raised, nothing looked wrong: the grid still had a
+  model-shaped shell in it, `solid` had just silently come to mean `shell`.
+- **Which is why it now cross-checks itself.** The mesh's own enclosed volume
+  says how many cells should be solid. A conservative voxelisation overshoots
+  that by about half a cell of thickness over the whole surface and *never*
+  undershoots — so coming in low is proof of a leak. 50 interior cells where
+  the volume demanded 41,000. That check is now permanent and its result is on
+  the panel.
+
+**Normalise occlusion against the mesh, not against theory.** Theory says an
+unoccluded facet sees the whole hemisphere. A facet on a real machine is
+surrounded by panel gaps, bolt heads and its own neighbours, so the raw mean
+here is 0.35 and shading straight off it drags the entire model into shadow.
+The 85th percentile is what this surface actually achieves with nothing in the
+way; that is the number worth calling "open".
+
+**The right generalisation of the panel.** The STL is a single watertight shell
+— every edge used exactly twice, one vertex-connected component — so there are
+no parts to list, select or explode. Rather than invent a decomposition, the
+panel became a *mesh report*: welded vertex count, edge manifoldness, decimation
+error against the source, and the displacement and mass the machine would have
+if it were really built 12 m tall (142 m³, 44 t at the calibrated plate
+density). All measured. `j`, `k`, `e` and `i` go silently inert, per the mode
+law, because there is genuinely nothing for them to act on.
+
+**Cache it beside the source.** Seven seconds cold, 0.19 s warm — a
+length-prefixed JSON report plus `array` blobs, invalidated on source size and
+mtime, byte-order stamped, written through a temp file, and any failure to read
+one just means rebuild. `.mmesh`, gitignored.
+
+And once more, the key soak earned its keep: cycling detail selected a `Part`
+that had never been given its explode vector, and the frame loop crashed on the
+first press. Nothing about looking at the render would have found it.
+
+Verified after the mesh work: 110 size × flag combinations and all six palettes,
+0 failures; 300 random keypresses, no traceback, clean exit; 60/60 signal
+teardowns; 24.4 ms/frame at 80×24 to 38.6 ms at 240×70 on the middle detail
+level, with `d` there to buy it back.
+
 ## Not built yet
 
 ### 1. Falling-code rain, fed from something real
