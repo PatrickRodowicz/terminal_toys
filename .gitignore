@@ -3,3 +3,8 @@ __pycache__/
 
 # mesh caches: regenerated from the source STL on demand
 *.mmesh
+
+# scratch built by mech_scanner/tools/
+mech_scanner/tools/_profile/
+mech_scanner/tools/_refdiff/
+mech_scanner/cache/

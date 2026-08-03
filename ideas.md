@@ -970,6 +970,176 @@ labelled as one. And `--builtin` still reports "MADCAT-X, 65.44 t", which is *my
 procedural invention and not the canonical machine — it should stop borrowing the
 name.
 
+#### Breaking the single file up, and what a closure costs
+
+At 4,034 lines the file had stopped being portable in any useful sense and had
+started being unnavigable, so it became a package: `mech_scanner/`, with the
+mesh pipeline, the renderer and the HUD in separate subpackages and the frame
+loop reduced to the order it calls them in. The single-file rule still holds for
+every other program here; it is dropped for this one, and the directory is still
+self-contained, which is what was actually valuable about the rule.
+
+Two things worth recording.
+
+**The acceptance test was pixel identity, and the mechanical part of the move
+was done by slicing rather than retyping.** The pure functions — everything from
+the ANSI codes to the segmentation to the built-in mech, lines 95 to 2346 — were
+cut out of the original by line range and given module headers, so the moved code
+is provably the same code. Only `main()` was rewritten. Then a script compared the
+package's code statements against the original's, in both directions, with
+docstrings stripped: everything the package added was an import or a rename I had
+made deliberately, and everything the original lost was inside `main()`. That
+caught an off-by-one that had dropped a `class` line and left a docstring
+dangling at module scope — which happens to still be valid Python, so it would
+have surfaced later as a confusing ImportError rather than a syntax error.
+
+Then 64 comparisons: twenty flag combinations across three terminal sizes,
+byte-for-byte on the emitted frames, plus the chrome compared with its
+wall-clock row masked and the boot sequence checked on its POST text. All
+identical, control clean. `--dt` was added to make that possible at all, since
+the frame loop integrates real time and two runs otherwise land at different
+azimuths.
+
+**The package came out 5–9% faster, and the reason is worth knowing.** That was
+not a goal and nothing was optimised. `main()` had five nested helper functions
+— `proj`, `otext`, `draw_grid`, `field`, `btext` — and a nested function that
+reads an enclosing local turns that local into a *cell*: every access becomes a
+`LOAD_DEREF` through a cell object instead of a `LOAD_FAST` into a slot. Those
+five closures captured 27 variables between them, including `ca`, `sa`, `ce`,
+`se`, `Fl`, `OX`, `OY`, `MCZ`, `SUBX`, `ras` and `ov` — which is to say, most of
+what the hot loops read. Disassembling the original: **306 `LOAD_DEREF` against
+49 `LOAD_FAST`**. Splitting the closures into module-level functions taking
+arguments turned all of it back into fast locals.
+
+Which is a real lesson and not a Python trivia point: a convenience closure
+inside a long function silently taxes every other line in that function, and
+the tax is invisible at the source level. Verified by disassembly rather than
+assumed from the timing, because "it got faster and I think I know why" is how
+folklore gets written down as fact.
+
+#### Pointing it at something that is not a Mad Cat
+
+"Can we point it at an arbitrary STL?" turned out to have two answers. It
+always could — the pipeline is generic, and a torus knot goes through
+decimation, voxelisation, occlusion and segmentation without complaint. But
+every canon fact was applied unconditionally, so the panel reported that torus
+knot as a 75-tonne Timber Wolf Prime with an arm L and a leg R, and `--stats`
+gave it a mean density of 0.037 t/m³ without blinking. The rendering was fine.
+The readout was inventing.
+
+The fix is the same rule the CANON table already had, applied one level up:
+nothing in a mesh says what the object *is*, and there is no measurement that
+can tell you. Facet count cannot, silhouette cannot. So canon is now attached
+deliberately — `--canon auto` means the bundled `mc.stl` and nothing else — and
+without it the COMBAT page becomes SURVEY: measured dimensions, volume, area,
+watertight and sealed, and the section shares by both volume and skin. **No
+mass.** A mesh has a volume; turning that into a tonnage needs a density, and
+picking a density that produces the tonnage you already believe is circular.
+
+The section names change with it, which is the part worth recording. What the
+segmentation actually finds is the largest eroded core plus up to two outboard
+components per side of the mirror plane, split by height. On the Timber Wolf
+those *are* a torso, two arms and two legs, and naming them so reports a fact.
+On anything else, calling one 'arm L' invents an anatomy the geometry never
+claimed — so they become core / upper L / upper R / lower L / lower R, which
+describes exactly what was measured. Same labels, same algorithm, honest names.
+
+Falling out of that: `built_mass` and `built_density` left the cached mesh
+report entirely. They were never measurements, and holding them there would
+have meant keying the cache on the canon choice. Now the report is measurement
+only and the cache is canon-independent — the same built mesh is valid whether
+or not you claim to know what it depicts. Cache version bumped to 9, which
+costs one rebuild and is what a version field is for.
+
+Two smaller things done at the same time. The `.mmesh` files used to be written
+beside the source STL, so pointing the renderer at a model in somebody else's
+directory left six ~350 KB files in it; they now live in one `cache/` directory
+inside the project, named by a digest of the absolute source path so two files
+called `model.stl` cannot collide. And the frame rate cap became a real control
+— default 60, `r` steps through 10/15/24/30/60/120/uncapped — because this is
+meant to sit in the corner of a screen and at 200×60 it will otherwise eat a
+core drawing frames nobody is looking at.
+
+The pixel-diff harness earned its keep again on the way through, and then
+needed fixing itself: the first case came back 0/55 while the same case at
+another size was 55/55. Not a rendering change — the *old* build was running
+against a cold cache and printing its load progress to stdout before the first
+frame, which shifted the frame stream by one. The harness now warms both caches
+and throws the output away before it compares anything. A harness that can
+report a spurious total failure is a harness you will eventually believe.
+
+#### Canon as data: one directory per machine
+
+The last piece of the arbitrary-mesh work. Canon was still a dict inside
+`canon.py`, which meant the program knew about exactly one machine and the only
+question it could answer was "is this that machine, or nothing?". Now a mech is
+a directory:
+
+    mechs/timber_wolf/
+        timber_wolf.stl
+        canon.md
+        reference.png
+
+and `scan.py timber_wolf` renders that mesh with those facts. Adding a machine
+is adding a directory, and the scanner can be pointed at any of them.
+
+The format is markdown tables. That was chosen over YAML (not in the standard
+library, and this project takes no dependencies) and over JSON (nobody wants to
+write prose in it) — a markdown table is trivially parseable with `str.split`
+and is a pleasant document to read and edit, and everything that is *not* a
+table row is prose the parser ignores, so the file explains itself. The Timber
+Wolf's canon.md carries its own note about why no weapon has a body location,
+which is exactly where that note belongs: next to the data, not in the renderer.
+
+Three rules moved from code into the format, and writing them down as rules is
+what made the panel code fall out:
+
+1. Every field needs a source; the sources are in the file and `--stats` prints
+   them beside the measurements.
+2. **A field nobody sourced is absent.** Not zero, not a plausible default. So
+   every block on the combat page became conditional on its data existing, and
+   an incomplete canon.md now gives a *shorter* readout instead of a confident
+   wrong one. A mech with no sourced engine has no AIRFRAME block at all.
+3. Geometry never supplies lore and lore never supplies geometry — already
+   true, but now structurally enforced, since the two live in different files.
+
+Two things fell out of rule 2 that were worth having anyway. The panel had been
+displaying a hardcoded `375 XL` on the HEAT block while carrying the real
+`Starfire 375 XL` in the canon table and never showing it; and `armour` and
+`intro` were parsed and thrown away. Making every line conditional on a field
+meant every field had to have a line, and those three surfaced.
+
+One self-inflicted regression, caught by diffing the panel against the previous
+build: the armour caption was changed from the hardcoded `ferro-fibrous, by
+area` to the canon armour name interpolated in, which rendered as `composite
+a-2 ferro-fibr` at 24 columns and said nothing. The caption's job is to say
+*how the tonnage was distributed* — it is the one line on that page mixing a
+canon number with a measured one — so it is now `by measured skin area` and the
+armour type went to AIRFRAME with the rest of the construction trivia.
+
+The pixel-diff trap fired twice more on the way through and both times looked
+like a regression:
+
+- All 50 frames differing, with the visible text identical — the REC lamp
+  blinking on `now % 1.4`. That is why the harness passes `--no-chrome`, and I
+  had left it off by hand.
+- All 50 differing again with `--no-chrome` on — the *reference* build was
+  running against a cold cache and printing its load progress to stdout before
+  the first frame, shifting the frame stream by one. Same cause as the one
+  `pixeldiff.py` was taught to warm up for; this was a hand-run comparison that
+  did not get the benefit.
+
+Both are the same lesson in different clothes: the comparison has to be of the
+thing under test and nothing else, and a harness will happily tell you the
+world has ended when what actually happened is that a clock ticked.
+
+Also gone in the tidy-up: `refactordiff.py`, whose reference file only exists in
+git history now and whose job `pixeldiff.py` does generically; the `reference/`
+directory, folded into the mech; and the launcher's old name, since a project
+called mech_scanner containing a `mechmodel.py` was one legacy too many. That
+rename collided with the package's own `scan.py` (the sensor sweep), which is
+now `sweep.py` — a better name for it regardless.
+
 ## Not built yet
 
 ### 1. Falling-code rain, fed from something real
