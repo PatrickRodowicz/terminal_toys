@@ -21,11 +21,26 @@
  A few thousand facets is not a compromise. At this resolution the model covers
  maybe 150x400 pixels, so it is already one facet per handful of pixels.
 
- The panel is a mesh report, and all of it is measured: welded vertex count,
- whether every edge is used exactly twice (which is what watertight means and
- what makes the enclosed volume a real number), the decimation error against
- the source, and the displacement and mass the thing would have if it were
- really built 12 metres tall.
+ The display is a targeting and diagnostics HUD, and it has two panels. The
+ COMBAT panel (default) is what a gunner would want: designation, tonnage,
+ loadout, heat sinks, speeds, and the armour spread over the machine's five
+ sections. The MESH panel (m) is the renderer's own report -- welded vertex
+ count, whether every edge is used exactly twice (which is what watertight
+ means and what makes the enclosed volume a real number), the decimation error
+ against the source, facets drawn and frame rate.
+
+ Two sources and no third, and every line says which it is. CANON is Sarna's
+ and is quoted, never rounded or filled in -- Sarna assigns no body location to
+ any Prime weapon, so neither does this program. Everything else is measured
+ off the mesh. Where they meet is stated: the armour spread is Sarna's twelve
+ tons distributed over MEASURED skin area, and the density is Sarna's 75 tons
+ over the measured displacement.
+
+ SCAN is not a progress bar. It fills with BEARING swept since the scan began
+ and completes on a full revolution; the percentage beside it is how much of
+ the hull actually returned. 'Every facet returned' was tried and measured as
+ the wrong test -- it stalls near 96%, because at a fixed tilt some of the hull
+ never faces the sensor at any bearing.
 
  With --builtin, or with no STL to hand, it draws a mech assembled here out of
  lofted convex hulls on a 17-bone skeleton -- articulated, so j and k walk the
@@ -44,16 +59,20 @@
     --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames)
 
  Live controls (h for the full list):
+   m     panel: combat / mesh
+   j k   target section -- NO TARGET, torso, arm L/R, leg L/R. The sections
+         are segmented off the occupancy grid; see SECTIONS.
    SPACE pause spin   q quit         h help        0 reset
    <- -> orbit        ^ v tilt       [ ] zoom      , . spin rate
-   d     detail       a occlusion    w wireframe   l labels
+   d     detail       a occlusion    w wireframe   l labels   S shadow
+   v     sensor: optical / thermal / lidar / xray
+   c     cutaway plane, - and = to move the station
    L     lighting: full / key / flat -- key drops the fill light, sheen,
          ambient and fog; flat drops lighting altogether, which on a
          one-material mesh leaves a silhouette.
    p     palette      1-6 direct     g grid x3     z zen      s stars
-   j k   select part  e explode      i idle -- the built-in model only, and
-         silently inert on a loaded mesh, which is one rigid shell with no
-         joints to move and nothing to select between.
+   e     explode      i idle -- the built-in model only, and silently inert
+         on a loaded mesh, which is one rigid shell with no joints to move.
 """
 import sys, os, math, time, shutil, argparse, signal, random, select
 import colorsys, struct, array, json, zlib
@@ -156,6 +175,46 @@ DENSITY = {
     'rust2': 0.31, 'metal': 0.53, 'metal2': 0.53, 'dark': 0.16,
     'tube': 0.16, 'glass': 0.12, 'haz_y': 0.31, 'haz_k': 0.31,
     'red': 0.31, 'green': 0.31, 'lamp': 0.06,
+}
+
+# --- canon ------------------------------------------------------------------
+# The vehicle in mc.stl is the Timber Wolf, Inner Sphere codename Mad Cat, and
+# its fiction is not mine to invent. Everything below is from Sarna, the
+# BattleTech wiki, and nothing has been rounded, averaged or filled in:
+#
+#   https://www.sarna.net/wiki/Timber_Wolf_(Mad_Cat)
+#   https://www.sarna.net/news/good-mechs-timber-wolf/
+#
+# Note what is deliberately ABSENT. Sarna lists the Prime's nine weapons but
+# assigns none of them to a body location, so this table does not either. An
+# earlier draft of this program put the ER larges "in the arms" and the LRM-20s
+# "in the side torsos"; that is the sort of thing everyone knows and nobody
+# sourced, and it is not in the table for that reason. If a location is wanted
+# it has to come from the wiki, not from the shape of the mesh or from me.
+CANON = {
+    'name':      'TIMBER WOLF',
+    'codename':  'MAD CAT',
+    'config':    'PRIME',
+    'mass_t':    75,                    # tons
+    'chassis':   'Type W3 Endo-Steel',
+    'engine':    'Starfire 375 XL',
+    'cruise':    54.0,                  # km/h
+    'flank':     86.4,                  # km/h
+    'walk_mp':   5,
+    'run_mp':    8,
+    'armour':    'Composite A-2 Ferro-Fibrous',
+    'armour_t':  12,                    # tons
+    'heatsinks': '15 double',
+    'podspace':  27.5,                  # tons
+    'intro':     2945,
+    'origin':    'Clan Wolf',
+    'quirk':     'Weak Head Armor (1)',
+    # Prime configuration. Counts are Sarna's; locations are not stated there.
+    'weapons': (('ER Large Laser', 2), ('ER Medium Laser', 2),
+                ('Medium Pulse Laser', 1), ('LRM-20', 2), ('Machine Gun', 2)),
+    'codename_origin':
+        "Phelan Kell's Wolfhound targeting computer switched between MAD and "
+        "CAT; Focht made the designation official.",
 }
 
 # --- palettes -------------------------------------------------------------
@@ -725,7 +784,7 @@ class Part:
     """
 
     def __init__(self, name, frame, mesh, group, trust_winding=False,
-                 ao=None, wear_amp=0.09):
+                 ao=None, wear_amp=0.09, sec=None, temp=None):
         """`trust_winding` turns the outward-from-centroid pass OFF, for a mesh
         that already has a consistent winding of its own -- an STL, say. The
         centroid trick is exact for a star-shaped primitive and badly wrong for
@@ -753,6 +812,11 @@ class Part:
         # unreproducible, which showed up the moment a pixel diff was used to
         # check an optimisation and the control run disagreed with itself on
         # 7% of pixels.
+        self.sec = sec
+        # Keep occlusion unfolded as well as folded: the shader wants it baked
+        # into brightness, and the diagnostics want the number itself.
+        self.aoraw = list(ao) if ao is not None else None
+        self.temp = list(temp) if temp is not None else None
         rng = random.Random(zlib.crc32(name.encode()) & 0xffff)
         self.wear = []
         self.wear_plain = []
@@ -813,6 +877,56 @@ FILL = normed((-0.62, 0.48, 0.18))
 #         same colour and the machine becomes a green cut-out. It is the
 #         fastest thing the renderer can draw and it buys about a millisecond
 #         over KEY, which is why KEY is the one worth reaching for.
+# Sensor channels. Each is a different question asked of the same mesh, and
+# each answers it from something already measured -- nothing here is a filter
+# laid over a picture.
+#   OPTICAL  the lit hull
+#   THERMAL  false colour from a heat field with the fusion plant as its
+#            source. See REACTOR_R. The first version false-coloured ambient
+#            occlusion alone and got a cold torso, which is nonsense on a
+#            machine built around a 375-rated reactor.
+#   LIDAR    front-face wireframe, graded by range. A surface return.
+#   XRAY     the same but WITHOUT backface culling, so the far side of the hull
+#            comes through. Wireframe rather than translucency because the
+#            painter's algorithm has no blend buffer to be honest with.
+SENSOR_OPTICAL, SENSOR_THERMAL, SENSOR_LIDAR, SENSOR_XRAY = 0, 1, 2, 3
+SENSOR_NAMES = ('OPTICAL', 'THERMAL', 'LIDAR', 'XRAY')
+
+# Cold -> hot. Fixed, not palette-derived: a thermal channel that changed
+# colour when you pressed p would be decoration, not an instrument.
+HEAT_STOPS = ((16, 20, 62), (40, 66, 150), (36, 150, 148), (120, 196, 90),
+              (232, 206, 84), (238, 132, 48), (244, 236, 220))
+HEAT_LUT = []
+for _i in range(65):
+    _t = _i / 64.0 * (len(HEAT_STOPS) - 1)
+    _a = min(len(HEAT_STOPS) - 2, int(_t))
+    HEAT_LUT.append(lerp(HEAT_STOPS[_a], HEAT_STOPS[_a + 1], _t - _a))
+
+# Scan-channel phosphor. Fixed, like the heat ramp, and deliberately not a
+# palette colour: the first attempt drew the wireframe in the palette's grid
+# olive, which on the daylit field put olive lines over olive ground.
+SCAN_COL = (150, 232, 198)
+SCAN_BG = (10, 14, 18)
+SCAN_GRAZE = 0.42        # |n . view| below this is a contour, and only those
+                         # get drawn -- outlining all 6,000 facets fills the
+                         # silhouette with scribble and shows nothing.
+
+# The heat field. Sarna gives this machine a Starfire 375 XL, and a fusion
+# plant is hotter than everything else on the mech put together -- so a
+# thermal channel whose brightest thing was an armpit was measuring the wrong
+# quantity. Occlusion is a real property, but it is the *trapping* term, not
+# the source.
+#
+# The source is a point at the measured centroid of the TORSO section. The
+# engine is not placed by hand and it is not eyeballed off the silhouette: it
+# is where the mass of the torso actually is, which for an XL plant filling
+# the centre and both sides is the honest available answer. Falloff is inverse
+# square, as a point source radiating into a solid must be. Occlusion stays in
+# as the second term, weaker: heat that reaches the skin in a joint has a
+# harder time leaving it.
+REACTOR_R = 0.20         # half-strength distance, as a fraction of mech height
+REACTOR_MIX = 0.76       # weight of the source term against the trapping term
+
 LIGHT_FULL, LIGHT_KEY, LIGHT_FLAT = 0, 1, 2
 LIGHT_NAMES = ('LIGHTING FULL', 'LIGHTING KEY ONLY', 'LIGHTING FLAT')
 LIGHT_ARGS = ('full', 'key', 'flat')
@@ -837,7 +951,7 @@ MODEL_H = 12.0            # world height every loaded model is normalised to
 LOD_TARGETS = (2600, 6200, 14000)
 LOD_NAMES = ('LOD LOW', 'LOD MEDIUM', 'LOD HIGH')
 CACHE_MAGIC = b'MMSH'
-CACHE_VER = 5
+CACHE_VER = 7
 CACHE_HEAD = '<HHIIId'
 CACHE_HLEN = len(CACHE_MAGIC) + struct.calcsize(CACHE_HEAD)
 SHADOW_BANDS = 14
@@ -1205,6 +1319,32 @@ def face_ao(verts, faces, solid, dims, org, s, radius_cells=4.0, steps=3):
     return out
 
 
+def heat_field(verts, faces, ao, core, height):
+    """Per-facet temperature in [0, 1]: reactor proximity plus trapping.
+
+    Baked at build time and cached, so the thermal channel costs the shader a
+    single list index at frame time -- the same trick occlusion already uses.
+    Normalised against its own maximum rather than against a theoretical one,
+    because the maximum is the skin nearest the plant and that is exactly the
+    thing the ramp's top end should mean.
+    """
+    if core is None or not faces:
+        return [0.0] * len(faces)
+    kx, ky, kz = core
+    r2 = (REACTOR_R * height) ** 2 or 1.0
+    out = []
+    for fi, (ia, ib, ic) in enumerate(faces):
+        pa, pb, pc = verts[ia], verts[ib], verts[ic]
+        dx = (pa[0] + pb[0] + pc[0]) / 3.0 - kx
+        dy = (pa[1] + pb[1] + pc[1]) / 3.0 - ky
+        dz = (pa[2] + pb[2] + pc[2]) / 3.0 - kz
+        q = 1.0 / (1.0 + (dx * dx + dy * dy + dz * dz) / r2)
+        trap = 1.0 - (ao[fi] if fi < len(ao) else 1.0)
+        out.append(REACTOR_MIX * q + (1.0 - REACTOR_MIX) * trap)
+    hi = max(out) or 1.0
+    return [min(1.0, v / hi) for v in out]
+
+
 def shadow_bands(verts, nbands=SHADOW_BANDS):
     """Ground shadow as a stack of height bands, each hulled separately.
 
@@ -1270,8 +1410,20 @@ def print_mesh_report(src, lods):
     print('AS BUILT   normalised to %.1f m tall, %.4f m per source unit'
           % (MODEL_H, src['scale']))
     print('  volume        %14.1f   m3' % src['built_volume'])
-    print('  mass          %14.1f   t at %.2f t/m3'
-          % (src['built_mass'], DENSITY['plate']))
+    # Mass is canon and density is derived, not the other way round.
+    print('  mass          %14.1f   t   (%s %s, per Sarna)'
+          % (src['built_mass'], CANON['name'], CANON['config']))
+    print('  mean density  %14.3f   t/m3  derived: canon mass / measured'
+          % src.get('built_density', 0.0))
+    print()
+    print('SECTIONS   segmented off the occupancy grid by erosion + watershed')
+    print('  %-8s %10s %10s' % ('section', 'volume m3', 'mass t'))
+    share = src.get('sec_share') or []
+    for i, sec in enumerate(SECTIONS):
+        if i < len(share):
+            print('  %-8s %10.1f %10.1f'
+                  % (SECTION_NAMES[sec], share[i] * src['built_volume'],
+                     share[i] * src['built_mass']))
     print()
     print('%-8s %8s %8s %6s %10s %10s' %
           ('LEVEL', 'FACETS', 'VERTS', 'GRID', 'VOL ERR', 'AREA ERR'))
@@ -1291,13 +1443,15 @@ class Model:
     """A loaded, decimated, occluded mesh at one level of detail, normalised so
     it stands MODEL_H tall on z = 0 and centred on the vertical axis."""
 
-    __slots__ = ('verts', 'faces', 'ao', 'report', 'shadow')
+    __slots__ = ('verts', 'faces', 'ao', 'report', 'shadow', 'sec', 'temp')
 
-    def __init__(self, verts, faces, ao, report):
+    def __init__(self, verts, faces, ao, report, sec=None, temp=None):
         self.verts = verts
         self.faces = faces
         self.ao = ao
         self.report = report
+        self.sec = sec if sec is not None else bytearray(len(faces))
+        self.temp = temp if temp is not None else [0.0] * len(faces)
         self.shadow = shadow_bands(verts)
 
 
@@ -1319,18 +1473,318 @@ def normalise(verts, up='z'):
             for v in verts], k
 
 
+# --- segmentation -----------------------------------------------------------
+# Split the mesh into the machine's own limbs, off the occupancy grid that was
+# already built for occlusion.
+#
+# The first attempt sliced the grid horizontally and took connected components
+# per slice -- a Reeb graph of the height function. It found the legs and the
+# missile pods cleanly and FAILED on the arms, giving one arm 2.9% of the hull
+# and the other 0.9%: above the hips an arm and the side of the torso fall in
+# the same 2D component wherever they overlap in plan view, and no amount of
+# per-slice connectivity will part them. That is measured, not suspected.
+#
+# Morphology fits the shape of the problem instead. A mech's joints are its
+# narrow places -- ankle, knee, hip, shoulder, elbow -- so erosion breaks them
+# first and the limbs fall off on their own. Erode to a core, take 3D connected
+# components as seeds, then grow every seed at once back over the full solid.
+# The simultaneous flood is a watershed: it assigns each cell to whichever core
+# reaches it first, which puts the boundary in the joint where it belongs.
+#
+# The torso is deliberately left whole -- everything that is not a limb is
+# TORSO. Splitting it into centre and side torsos is a later job.
+SECTIONS = ('TORSO', 'LA', 'RA', 'LL', 'RL')
+SECTION_NAMES = {'TORSO': 'torso', 'LA': 'arm L', 'RA': 'arm R',
+                 'LL': 'leg L', 'RL': 'leg R'}
+# Erosion depth is NOT a constant. It has to scale with the voxel resolution --
+# at 96^3 a depth of 6 parts the limbs cleanly, at the default 80^3 the same
+# depth erases them and leaves two lumps. So sweep it, and let bilateral
+# symmetry decide: the correct depth is the deepest one that still finds at
+# least two outboard components on EACH side of the mirror plane, which is
+# what a mech with two arms and two legs must produce. Nothing in the search
+# knows the machine is symmetric, so when it agrees, that agreement is
+# evidence rather than assumption.
+ERODE_SWEEP = (8, 7, 6, 5, 4, 3, 2)
+SEG_MIN_CELLS = 40
+SEG_LAT_FRAC = 0.10       # outboard means this far off the mirror plane
+
+
+def mirror_plane(solid, dims, step=3.0):
+    """The vertical plane that best maps the solid onto itself.
+
+    Needed because the obvious shortcut -- lateral axis = whichever way the
+    legs are furthest apart -- is a coin flip on this mesh: the Mad Cat is
+    modelled mid-stride and its legs are separated diagonally, 35.3 grid units
+    one way against 38.1 the other. Structure is symmetric even when pose is
+    not, and the symmetric mass outweighs the stride.
+
+    Returns (lateral_x, lateral_y, centre_x, centre_y, score). The score is
+    reported rather than asserted: it comes out at 0.686 against a worst case
+    of 0.327, and it is NOT 1.0 precisely because the stride is real.
+    """
+    nx, ny, nz = dims
+    nxy = nx * ny
+    cells = []
+    for p in range(len(solid)):
+        if solid[p]:
+            k, rem = divmod(p, nxy)
+            j, i = divmod(rem, nx)
+            cells.append((i, j, k))
+    if not cells:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+    occ = set(cells)
+    cx = sum(c[0] for c in cells) / len(cells)
+    cy = sum(c[1] for c in cells) / len(cells)
+    best = None
+    ang = 0.0
+    while ang < 180.0:            # a plane and its opposite are one plane
+        a = math.radians(ang)
+        ux, uy = math.cos(a), math.sin(a)
+        hit = 0
+        for i, j, k in cells:
+            dx, dy = i - cx, j - cy
+            d = 2.0 * (dx * ux + dy * uy)
+            if (int(round(cx + dx - d * ux)),
+                    int(round(cy + dy - d * uy)), k) in occ:
+                hit += 1
+        sc = hit / float(len(cells))
+        if best is None or sc > best[0]:
+            best = (sc, ux, uy)
+        ang += step
+    return best[1], best[2], cx, cy, best[0]
+
+
+def _erode(solid, dims, n):
+    nx, ny, nz = dims
+    nxy = nx * ny
+    cur = solid
+    for _ in range(n):
+        out = bytearray(len(cur))
+        for p in range(len(cur)):
+            if not cur[p]:
+                continue
+            k, rem = divmod(p, nxy)
+            j, i = divmod(rem, nx)
+            if (i == 0 or j == 0 or k == 0 or i == nx - 1 or j == ny - 1
+                    or k == nz - 1):
+                continue
+            if (cur[p - 1] and cur[p + 1] and cur[p - nx] and cur[p + nx]
+                    and cur[p - nxy] and cur[p + nxy]):
+                out[p] = 1
+        cur = out
+    return cur
+
+
+def _components_3d(grid, dims, minsize):
+    nx, ny, nz = dims
+    nxy = nx * ny
+    seen = bytearray(len(grid))
+    comps = []
+    for start in range(len(grid)):
+        if seen[start] or not grid[start]:
+            continue
+        q = deque([start])
+        seen[start] = 1
+        cells = []
+        while q:
+            p = q.popleft()
+            cells.append(p)
+            k, rem = divmod(p, nxy)
+            j, i = divmod(rem, nx)
+            for d, ok in ((-1, i > 0), (1, i < nx - 1), (-nx, j > 0),
+                          (nx, j < ny - 1), (-nxy, k > 0), (nxy, k < nz - 1)):
+                p2 = p + d
+                if ok and not seen[p2] and grid[p2]:
+                    seen[p2] = 1
+                    q.append(p2)
+        if len(cells) >= minsize:
+            comps.append(cells)
+    comps.sort(key=len, reverse=True)
+    return comps
+
+
+def segment_solid(solid, dims, note=None):
+    """Label every solid cell TORSO / LA / RA / LL / RL.
+
+    Limbs are named by measurement, never by which way the STL happens to face:
+    a component is an arm or a leg by its height and how far it sits off the
+    measured mirror plane, and left from right by the sign of that offset.
+    """
+    nx, ny, nz = dims
+    nxy = nx * ny
+    ux, uy, cx, cy, score = mirror_plane(solid, dims)
+    if note:
+        note('mirror plane %.0f%% symmetric' % (score * 100.0))
+    lat_min = SEG_LAT_FRAC * max(nx, ny)
+    comps = []
+    stats = []
+    depth_used = 0
+    for depth in ERODE_SWEEP:
+        core = _erode(solid, dims, depth)
+        cs = _components_3d(core, dims, SEG_MIN_CELLS)
+        st = []
+        for ci, cells in enumerate(cs):
+            sx = sy = sz = 0
+            for p in cells:
+                k, rem = divmod(p, nxy)
+                j, i = divmod(rem, nx)
+                sx += i; sy += j; sz += k
+            n = float(len(cells))
+            st.append({'i': ci, 'n': len(cells), 'z': (sz / n) / max(1, nz - 1),
+                       'lat': (sx / n - cx) * ux + (sy / n - cy) * uy})
+        left = [x for x in st[1:] if x['lat'] < -lat_min]
+        right = [x for x in st[1:] if x['lat'] > lat_min]
+        if len(left) >= 2 and len(right) >= 2:
+            comps, stats, depth_used = cs, st, depth
+            break
+    if not comps:                       # nothing parted: one solid lump
+        comps = _components_3d(solid, dims, SEG_MIN_CELLS)
+        stats = [{'i': 0, 'n': len(comps[0]) if comps else 0, 'z': 0.5,
+                  'lat': 0.0}]
+    if note:
+        note('limbs parted at erosion %d' % depth_used)
+
+    # The trunk is simply the biggest core; everything is measured against it.
+    lab_of = {0: 'TORSO'}
+    # Pick per SIDE, never globally: taking 'the two largest remaining' picked
+    # two components off the same shoulder and left the other arm unlabelled.
+    for sgn, leg_tag, arm_tag in ((-1, 'LL', 'LA'), (1, 'RL', 'RA')):
+        side = [x for x in stats[1:]
+                if (x['lat'] < -lat_min if sgn < 0 else x['lat'] > lat_min)]
+        if not side:
+            continue
+        leg = min(side, key=lambda x: x['z'])       # a leg reaches the ground
+        lab_of[leg['i']] = leg_tag
+        rest = [x for x in side if x is not leg and x['z'] > leg['z']]
+        if rest:                                    # an arm hangs, it does not
+            lab_of[max(rest, key=lambda x: x['n'])['i']] = arm_tag
+    for x in stats:
+        lab_of.setdefault(x['i'], 'TORSO')
+
+    idx = dict((s, i) for i, s in enumerate(SECTIONS))
+    lab = bytearray(len(solid))
+    q = deque()
+    for ci, cells in enumerate(comps):
+        v = idx[lab_of[ci]] + 1
+        for p in cells:
+            lab[p] = v
+            q.append(p)
+    while q:                       # one flood, all cores at once: a watershed
+        p = q.popleft()
+        v = lab[p]
+        k, rem = divmod(p, nxy)
+        j, i = divmod(rem, nx)
+        for d, ok in ((-1, i > 0), (1, i < nx - 1), (-nx, j > 0),
+                      (nx, j < ny - 1), (-nxy, k > 0), (nxy, k < nz - 1)):
+            p2 = p + d
+            if ok and solid[p2] and not lab[p2]:
+                lab[p2] = v
+                q.append(p2)
+    counts = [0] * len(SECTIONS)
+    for v in lab:
+        if v:
+            counts[v - 1] += 1
+    return lab, counts, (ux, uy, cx, cy, score)
+
+
+def face_sections(verts, faces, lab, dims, org, s):
+    """Section index per facet, from the labelled cell its centroid sits in."""
+    nx, ny, nz = dims
+    ox, oy, oz = org
+    nxy = nx * ny
+    out = bytearray(len(faces))
+    for fi, (ia, ib, ic) in enumerate(faces):
+        pa, pb, pc = verts[ia], verts[ib], verts[ic]
+        i = int(((pa[0] + pb[0] + pc[0]) / 3.0 - ox) * s)
+        j = int(((pa[1] + pb[1] + pc[1]) / 3.0 - oy) * s)
+        k = int(((pa[2] + pb[2] + pc[2]) / 3.0 - oz) * s)
+        v = 0
+        if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
+            v = lab[(k * ny + j) * nx + i]
+        if not v:
+            # A facet centroid can land just outside the solid on a thin
+            # panel; take the nearest labelled cell in a small neighbourhood
+            # rather than silently calling it torso.
+            best = None
+            for dk in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    for di in (-1, 0, 1):
+                        i2, j2, k2 = i + di, j + dj, k + dk
+                        if 0 <= i2 < nx and 0 <= j2 < ny and 0 <= k2 < nz:
+                            w = lab[(k2 * ny + j2) * nx + i2]
+                            if w:
+                                best = w
+                                break
+                    if best:
+                        break
+                if best:
+                    break
+            v = best or 1
+        out[fi] = v - 1
+    return out
+
+
+def section_centroid(lab, dims, org, s, si):
+    """Centroid of one labelled section, back in SOURCE coordinates.
+
+    `s` is cells per source unit, the same convention face_sections uses, so
+    the way back out is a division.
+    """
+    nx, ny, _nz = dims
+    nxy = nx * ny
+    tag = si + 1
+    sx = sy = sz = 0
+    n = 0
+    for p, v in enumerate(lab):
+        if v == tag:
+            k, rem = divmod(p, nxy)
+            j, i = divmod(rem, nx)
+            sx += i
+            sy += j
+            sz += k
+            n += 1
+    if not n:
+        return None
+    return (org[0] + (sx / float(n) + 0.5) / s,
+            org[1] + (sy / float(n) + 0.5) / s,
+            org[2] + (sz / float(n) + 0.5) / s)
+
+
+def _section_share(counts):
+    """Fraction of the enclosed volume in each section, from VOXEL counts.
+
+    An earlier version summed signed tetrahedron volumes per section, on the
+    argument that the divergence theorem would sort out the open boundary.
+    It does not: the fan integral is only volume for a CLOSED surface, and for
+    an open patch the answer depends on where the patch's rim sits relative to
+    the origin. The evidence was the arms coming out 3.1 m3 against 5.8 m3 --
+    a near 2:1 split between two limbs whose facet counts agreed to within 4%.
+
+    Counting labelled cells has no such problem. The watershed assigns every
+    solid cell to exactly one section, so the counts are a true partition of
+    the enclosed volume, and the legs now agree exactly.
+    """
+    tot = float(sum(counts)) or 1.0
+    return [c / tot for c in counts]
+
+
 def build_model(tris, src, target, up, ao_radius, grid, note=None):
     """Decimate, occlude, normalise. Occlusion is measured in the source mesh's
     own coordinates -- the voxel grid is built from the source triangles, and
     the decimated vertices have not been moved yet -- so the two never have to
     agree on a transform."""
-    solid, dims, org, s, shell, sol, sealed, vox = grid
+    (solid, dims, org, s, shell, sol, sealed, vox, seclab, seccount,
+     core) = grid
     if note:
         note('decimating %s facets to %s' % (commas(len(tris)), commas(target)))
     verts, faces, ncell = decimate_to(tris, target)
     if note:
         note('occluding %s facets' % commas(len(faces)))
     ao = face_ao(verts, faces, solid, dims, org, s, ao_radius)
+    # Sections, like occlusion, are read in the SOURCE mesh's coordinates --
+    # before normalise() moves anything -- so the labelled grid and the
+    # decimated vertices never need to agree on a transform.
+    sec = face_sections(verts, faces, seclab, dims, org, s)
     # Normalise against the mesh's own open-sky value rather than against 1.0.
     # Theory says an unoccluded facet sees the whole hemisphere, but a facet on
     # a real machine is surrounded by panel gaps, bolt heads and its own
@@ -1341,11 +1795,33 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
     ref = sorted(ao)[int(len(ao) * 0.85)] if ao else 1.0
     if ref > 1e-3:
         ao = [min(1.0, a / ref) for a in ao]
+    # Heat, while the vertices are still in source coordinates -- the reactor
+    # centroid came out of the voxel grid and lives in the same frame.
+    src_h_raw = ((src['bbox'][1] if up == 'y' else src['bbox'][2])
+                 if src.get('bbox') else 0.0) or 1.0
+    temp = heat_field(verts, faces, ao, core, src_h_raw)
     verts, scale = normalise(verts, up)
+    # Scale must come from the SOURCE height, not the decimated one. Decimation
+    # pulls the extreme vertices in slightly, so a per-LOD scale made the
+    # machine's displacement -- and now its derived density -- change every
+    # time d was pressed: 142.4 m3 at low detail against 138.8 at high, for
+    # one unchanging object. The source is the truth; the LOD is an
+    # approximation of it and does not get a vote on how big the mech is.
+    if src.get('bbox'):
+        # bbox is in SOURCE axes, so pick the one that 'up' will become.
+        src_h = src['bbox'][1] if up == 'y' else src['bbox'][2]
+        if src_h:
+            scale = MODEL_H / src_h
 
     # Decimated volume and area, for the reduction report.
     dvol = darea = 0.0
-    for ia, ib, ic in faces:
+    # Area per section as well as volume. Armour is a skin, so when the panel
+    # spreads Sarna's twelve tons over the machine it has to spread it by
+    # surface, not by displacement -- an arm has far more skin per cubic metre
+    # than the torso does, and distributing by volume would have quietly
+    # armoured the torso at the limbs' expense.
+    sec_area = [0.0] * len(SECTIONS)
+    for fi, (ia, ib, ic) in enumerate(faces):
         pa, pb, pc = verts[ia], verts[ib], verts[ic]
         dvol += (pa[0] * (pb[1] * pc[2] - pb[2] * pc[1])
                  - pa[1] * (pb[0] * pc[2] - pb[2] * pc[0])
@@ -1355,9 +1831,15 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
         mx = uy * vz - uz * vy
         my = uz * vx - ux * vz
         mz = ux * vy - uy * vx
-        darea += math.sqrt(mx * mx + my * my + mz * mz)
+        fa = math.sqrt(mx * mx + my * my + mz * mz)
+        darea += fa
+        si = sec[fi]
+        if si < len(sec_area):
+            sec_area[si] += fa
     dvol = abs(dvol) / 6.0
     darea /= 2.0
+    _atot = sum(sec_area) or 1.0
+    sec_area = [a / _atot for a in sec_area]
 
     report = dict(src)
     report.update({
@@ -1375,14 +1857,23 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
         # displacement of the machine change every time you press d.
         'built_volume': src['volume'] * scale ** 3,
         'built_area': src['area'] * scale ** 2,
-        'built_mass': src['volume'] * scale ** 3 * DENSITY['plate'],
+        # Mass is Sarna's 75 tons, not a density guess. The density is the
+        # DERIVED figure now: canon tonnage over measured displacement. That
+        # is the right way round -- the wiki owns the tonnage, the mesh owns
+        # the geometry, and neither is asked to supply the other's number.
+        'built_mass': float(CANON['mass_t']),
+        'built_density': (float(CANON['mass_t']) / (src['volume'] * scale ** 3)
+                          if src.get('volume') else 0.0),
+        'sec_share': _section_share(seccount),
+        'sec_area': sec_area,
+        'reactor': list(core) if core else None,
         'lod_volume': dvol, 'lod_area': darea,
         'vol_err': (dvol / (src['volume'] * scale ** 3) - 1.0) * 100.0
                    if src.get('volume') else 0.0,
         'area_err': (darea / (src['area'] * scale ** 2) - 1.0) * 100.0
                     if src.get('area') else 0.0,
     })
-    return Model(verts, faces, ao, report)
+    return Model(verts, faces, ao, report, sec, temp)
 
 
 def _cache_path(path, target, up, ao_radius, vox):
@@ -1416,13 +1907,19 @@ def _cache_read(cp, mtime):
         o += nf * 12
         aa = array.array('f')
         aa.frombytes(d[o:o + nf * 4])
-        if len(va) != nv * 3 or len(fa) != nf * 3 or len(aa) != nf:
+        o += nf * 4
+        sec = bytearray(d[o:o + nf])
+        o += nf
+        ta = array.array('f')
+        ta.frombytes(d[o:o + nf * 4])
+        if (len(va) != nv * 3 or len(fa) != nf * 3 or len(aa) != nf
+                or len(sec) != nf or len(ta) != nf):
             return None
     except Exception:
         return None       # a truncated or foreign cache just means rebuild
     verts = [(va[i * 3], va[i * 3 + 1], va[i * 3 + 2]) for i in range(nv)]
     faces = [(fa[i * 3], fa[i * 3 + 1], fa[i * 3 + 2]) for i in range(nf)]
-    return Model(verts, faces, list(aa), report)
+    return Model(verts, faces, list(aa), report, sec, list(ta))
 
 
 def _cache_write(cp, m, mtime):
@@ -1438,6 +1935,8 @@ def _cache_write(cp, m, mtime):
             fh.write(array.array('f', [c for v in m.verts for c in v]).tobytes())
             fh.write(array.array('i', [c for f in m.faces for c in f]).tobytes())
             fh.write(array.array('f', m.ao).tobytes())
+            fh.write(bytes(m.sec))
+            fh.write(array.array('f', m.temp).tobytes())
         os.replace(tmp, cp)
     except OSError:
         pass          # a read-only directory is no reason to fail to draw
@@ -1474,6 +1973,14 @@ def load_models(path, targets, up='z', ao_radius=4.0, vox=80, note=None,
                 if note:
                     note('voxelising at %d^3' % vox)
                 grid = voxel_solid(tris, vox, want_volume=src['volume']) + (vox,)
+                if note:
+                    note('segmenting limbs')
+                seclab, seccount, _mir = segment_solid(grid[0], grid[1], note)
+                # Where the reactor is: the centroid of the torso's own mass,
+                # measured, not sited by hand. The thermal channel needs it.
+                core = section_centroid(seclab, grid[1], grid[2], grid[3],
+                                        SECTIONS.index('TORSO'))
+                grid = grid + (seclab, seccount, core)
             m = build_model(tris, src, t, up, ao_radius, grid, note)
             if use_cache:
                 _cache_write(cp, m, mtime)
@@ -1770,33 +2277,31 @@ def hull2d(pts):
 GRID_SOLID, GRID_XRAY, GRID_OFF = 0, 1, 2
 GRID_NAMES = ('GRID', 'GRID X-RAY', 'GRID OFF')
 
+# Keys only. This was a page and a half of prose at one point, which is a
+# strange thing to put behind a key you press mid-orbit to remember what 'v'
+# does. The prose that was worth keeping is in the module docstring and in the
+# comments beside the things it describes; the rest was explaining decisions to
+# someone who did not ask.
 HELP = [
     'MECHMODEL // controls',
     '',
-    'SPACE  pause the turntable      q      quit',
-    '<- ->  orbit                    ^ v    tilt',
-    '[ ]    zoom                     , .    spin rate',
-    'd      detail: low / med / high a      ambient occlusion',
-    'w      wireframe                l      labels',
-    'L      lighting: full/key/flat  j k    select a part',
-    'g      grid: solid / x-ray/ off e      exploded view',
-    'p      cycle palette            i      idle animation',
-    's      starfield                1-6    palette direct',
-    '0      reset the view           z      zen (hide the HUD)',
-    'h      this help',
+    'SPACE  pause turntable    v      sensor channel',
+    '<- ->  orbit              c      cutaway plane',
+    '^ v    tilt               - =    move the cut',
+    '[ ]    zoom               j k    target section',
+    ', .    spin rate          m      panel: combat/mesh',
+    'd      detail             l      labels',
+    'a      occlusion          L      lighting',
+    'w      wireframe          S      cast shadow',
+    'g      grid               p 1-6  palette',
+    's      starfield          e      exploded view',
+    'i      idle animation     z      zen (hide HUD)',
+    '0      reset              h      this help    q  quit',
     '',
-    'On a loaded mesh, j k e and i are inert: it is a single',
-    'watertight shell with no joints and no parts to separate.',
-    '',
-    'L trades lighting for frame rate. key keeps the key light',
-    'and drops the fill, the sheen, the ambient and the fog --',
-    'still solid-looking, about 20% off the shading stage. flat',
-    'drops lighting entirely; on a one-material mesh that leaves',
-    'a silhouette, so it is a speed floor, not a view.',
-    '',
-    'Everything in the panel is measured off the mesh -- the',
-    'decimation error against the source, the enclosed volume,',
-    'the mass at 12 m. None of it is typed in.',
+    'j k cycle NO TARGET -> torso -> arms -> legs.',
+    'SCAN fills with BEARING swept, not with time; the',
+    'percentage is how much of the hull actually came',
+    'back. A full turn ends it. 0 restarts it.',
 ]
 
 
@@ -1832,6 +2337,9 @@ def main():
     ap.add_argument('--no-stars', action='store_true')
     ap.add_argument('--no-shadow', action='store_true')
     ap.add_argument('--no-idle', action='store_true')
+    ap.add_argument('--sensor', default='optical',
+                    choices=[n.lower() for n in SENSOR_NAMES],
+                    help='sensor channel to start in')
     ap.add_argument('--lighting', default='full', choices=LIGHT_ARGS,
                     help='full / key (key light only) / flat (no lighting; '
                          'a single-material mesh becomes a silhouette)')
@@ -1881,10 +2389,48 @@ def main():
             mv = _MeshView(m.verts, m.faces, 'plate')
             lods.append(Part(os.path.basename(stl_path), root, mv, 'hull',
                              trust_winding=True,
-                             ao=None if args.no_ao else m.ao, wear_amp=0.055))
+                             ao=None if args.no_ao else m.ao, wear_amp=0.055,
+                             sec=m.sec, temp=m.temp))
             lods[-1].model = m
         lod = min(args.lod, len(lods) - 1)
         parts = [lods[lod]]
+
+    # The built-in mech needs a heat field too, or the thermal channel is a
+    # flat silhouette on it -- and worse, with no temperature to carry, the
+    # per-facet 'hot' slot still held the SELECTION flag, so picking a part
+    # made it read white hot. Same physics as the loaded mesh: a point source
+    # at the torso, inverse square, no occlusion term because the procedural
+    # parts have none.
+    if not lods and parts:
+        for f in forder:
+            f.resolve()
+
+        def _wc(pt, fr):
+            q = mvec(fr.M, pt)
+            return (q[0] + fr.T[0], q[1] + fr.T[1], q[2] + fr.T[2])
+
+        tp = [p for p in parts if p.name == 'torso hull'] or parts
+        kx = sum(_wc(p.centroid, p.frame)[0] for p in tp) / len(tp)
+        ky = sum(_wc(p.centroid, p.frame)[1] for p in tp) / len(tp)
+        kz = sum(_wc(p.centroid, p.frame)[2] for p in tp) / len(tp)
+        # Scale off the built-in's own height, not MODEL_H: the procedural
+        # mech is modelled in its own units and is not normalised to the
+        # loaded mesh's twelve metres.
+        _zs = [_wc(v, p.frame)[2] for p in parts for v in p.v]
+        _h = (max(_zs) - min(_zs)) or 1.0
+        _hi = 0.0
+        for p in parts:
+            p.temp = []
+            for _idx, _mat, _n, lc in p.faces:
+                wx, wy, wz = _wc(lc, p.frame)
+                d2 = ((wx - kx) ** 2 + (wy - ky) ** 2 + (wz - kz) ** 2)
+                v = 1.0 / (1.0 + d2 / ((REACTOR_R * _h) ** 2))
+                p.temp.append(v)
+                if v > _hi:
+                    _hi = v
+        _hi = _hi or 1.0
+        for p in parts:
+            p.temp = [v / _hi for v in p.temp]
 
     if args.stats:
         if lods:
@@ -1963,12 +2509,25 @@ def main():
     shadow_on = not args.no_shadow
     idle_on = not args.no_idle
     light_mode = LIGHT_ARGS.index(args.lighting)
+    sensor = SENSOR_NAMES.index(args.sensor.upper())
+    cutaway = False
+    cut_z = 0.55
     labels = False
     wire = False
     explode = 0.0
     explode_t = 0.0
-    sel = 0
+    sel = -1              # -1 is NO TARGET, and it is the state you start in
+    panel_mode = 0        # 0 combat, 1 mesh
     show_help = False
+    # Sensor coverage. Not a decorative barber pole: a byte per facet, set the
+    # first time that facet survives the backface test, so the bar measures how
+    # much of the hull the sensor has actually returned as the target turns.
+    # It fills as you orbit, it completes, and it stays complete.
+    scan_seen = None
+    scan_left = 0
+    scan_tot = 0
+    scan_sweep = 0.0      # radians of bearing covered since the scan began
+    scan_az = None
     flash, flash_until = '', 0.0
 
     # The model's own extent, measured once at the rest pose. The camera fit
@@ -2067,12 +2626,24 @@ def main():
                     spin = min(6.0, spin + 0.25)
                     flash, flash_until = f'SPIN {spin:+.2f}', now + 0.8
                 elif k in ('j', '\t', 'k'):
-                    # A loaded mesh is one shell -- the source is watertight and
-                    # vertex-connected throughout -- so there is nothing to
-                    # select between, and per the mode law the key goes
-                    # silently inert rather than explaining itself.
-                    if not stl_mode:
-                        sel = (sel + (1 if k != 'k' else -1)) % len(parts)
+                    # Alive again on a loaded mesh: the shell is still one
+                    # watertight body, but it has been segmented into the
+                    # machine's own limbs, so there is something to select
+                    # between after all.
+                    # -1 is a real state, not a sentinel to skip past: a
+                    # gunner who wants the whole machine and no section
+                    # highlighted has to be able to get there, and the cycle
+                    # is the obvious way in and out of it.
+                    n_sel = len(SECTIONS) if stl_mode else len(parts)
+                    sel = (sel + (2 if k != 'k' else 0)) % (n_sel + 1) - 1
+                    if stl_mode:
+                        flash, flash_until = (
+                            'NO TARGET' if sel < 0 else
+                            SECTION_NAMES[SECTIONS[sel]].upper(), now + 0.8)
+                elif k == 'm':
+                    panel_mode = (panel_mode + 1) % 2
+                    flash, flash_until = (
+                        ('COMBAT', 'MESH')[panel_mode] + ' PANEL', now + 0.8)
                 elif k == 'e':
                     if not stl_mode:
                         explode_t = 0.0 if explode_t > 0.5 else 1.0
@@ -2082,7 +2653,8 @@ def main():
                     if stl_mode and len(lods) > 1:
                         lod_i = (lod_i + 1) % len(lods)
                         parts = [lods[lod_i]]
-                        sel = 0
+                        sel = -1
+                        scan_seen = None      # different mesh, different hull
                         flash, flash_until = (
                             '%s  %s FACETS'
                             % (LOD_NAMES[lod_i] if lod_i < len(LOD_NAMES)
@@ -2101,6 +2673,22 @@ def main():
                 elif k == 'L':
                     light_mode = (light_mode + 1) % 3
                     flash, flash_until = LIGHT_NAMES[light_mode], now + 0.9
+                elif k == 'v':
+                    sensor = (sensor + 1) % len(SENSOR_NAMES)
+                    flash, flash_until = ('SENSOR ' + SENSOR_NAMES[sensor],
+                                          now + 0.9)
+                elif k == 'c':
+                    cutaway = not cutaway
+                    flash, flash_until = ('CUTAWAY' if cutaway
+                                          else 'CUTAWAY OFF', now + 0.8)
+                elif k == '-':
+                    cut_z = max(0.02, cut_z - 0.04)
+                elif k == '=':
+                    cut_z = min(0.99, cut_z + 0.04)
+                elif k == 'S':
+                    shadow_on = not shadow_on
+                    flash, flash_until = ('SHADOW ON' if shadow_on
+                                          else 'SHADOW OFF', now + 0.8)
                 elif k == 'g':
                     grid_mode = (grid_mode + 1) % 3
                     flash, flash_until = GRID_NAMES[grid_mode], now + 0.8
@@ -2131,6 +2719,7 @@ def main():
                                           1.0, args.speed)
                     DIST, explode_t, wire = args.dist, 0.0, False
                     grid_mode, paused = GRID_SOLID, False
+                    sel, scan_seen = -1, None      # target dropped, scan rerun
                     flash, flash_until = 'RESET', now + 0.8
                 elif k == 'ESC':
                     show_help = False
@@ -2182,27 +2771,45 @@ def main():
                 return (OX + Fl * SUBX * xr / zv,
                         OY - Fl * (yr * se + z * ce) / zv, zv)
 
-            # ---- sky ----
-            sky0, sky1 = P['sky']
-            horizon = int(pxh * 0.60)
-            for yb in range(0, horizon, 2):
-                t = yb / max(1, horizon)
-                ras.hband(yb, yb + 2, quant(lerp(sky0, sky1, t * t)))
-            ras.hband(horizon, pxh, quant(P['ground']))
-            if stars_on and P['star'] is not None:
-                sc_ = P['star']
-                for sxp, syp, br, ph in stars:
-                    if syp >= horizon:
-                        continue
-                    tw = 0.55 + 0.45 * math.sin(sim * 2.0 + ph)
-                    ras.point(sxp, syp, quant(shade(sc_, br * tw * 0.9)))
+            psel_on = sensor != SENSOR_THERMAL
+            see_through = sensor == SENSOR_XRAY
+            wireonly = sensor in (SENSOR_LIDAR, SENSOR_XRAY)
+            # Any channel that is not the eye draws on an instrument field.
+            # Gating this on `wireonly` alone left THERMAL sitting on a blue
+            # sky over daylit olive ground with a hard sun shadow under it,
+            # which reads as an optical photograph that somebody tinted --
+            # exactly the thing the channel is not.
+            nosun = wireonly or sensor == SENSOR_THERMAL
+            cutplane = (MZ0 + (MZ1 - MZ0) * cut_z) if cutaway else None
 
+            # ---- sky ----
+            if nosun:
+                # No sun in a sensor return: a scan channel draws on an
+                # instrument field, not on a daylit sky. Leaving the sky
+                # and the cast shadow in put olive ground and a hard sun
+                # shadow behind a lidar trace, which read as a bug.
+                ras.clear(quant(SCAN_BG))
+            else:
+                sky0, sky1 = P['sky']
+                horizon = int(pxh * 0.60)
+                for yb in range(0, horizon, 2):
+                    t = yb / max(1, horizon)
+                    ras.hband(yb, yb + 2, quant(lerp(sky0, sky1, t * t)))
+                ras.hband(horizon, pxh, quant(P['ground']))
+                if stars_on and P['star'] is not None:
+                    sc_ = P['star']
+                    for sxp, syp, br, ph in stars:
+                        if syp >= horizon:
+                            continue
+                        tw = 0.55 + 0.45 * math.sin(sim * 2.0 + ph)
+                        ras.point(sxp, syp, quant(shade(sc_, br * tw * 0.9)))
             # ---- ground plane and grid ----
             GR = MRAD * 3.4
             gq = [proj(x, y, 0.0) for x, y in
                   ((-GR, -GR), (GR, -GR), (GR, GR), (-GR, GR))]
-            ras.fill([q[:2] for q in gq], quant(shade(P['ground'], 1.25)),
-                     quant(shade(P['ground'], 0.7)))
+            if not nosun:
+                ras.fill([q[:2] for q in gq], quant(shade(P['ground'], 1.25)),
+                         quant(shade(P['ground'], 0.7)))
 
             def draw_grid(gc):
                 step = GR / 8.0
@@ -2244,15 +2851,15 @@ def main():
             # and not the mech, those hulls are static and were computed once
             # at load. The built-in model is already a set of parts, so each
             # part's own bounding box is the natural band.
-            if shadow_on and SUN[2] > 0.05 and explode < 0.4:
+            if shadow_on and not nosun and SUN[2] > 0.05 and explode < 0.4:
                 shc = quant(lerp(P['ground'], P['shadow'],
                                  0.75 * (1.0 - explode / 0.4)))
-            if shadow_on and SUN[2] > 0.05 and stl_mode:
+            if shadow_on and not nosun and SUN[2] > 0.05 and stl_mode:
                 for band in parts[0].model.shadow:
                     sp = [proj(bx, by, 0.01)[:2] for bx, by in band]
                     if len(sp) >= 3:
                         ras.fill(sp, shc)
-            elif shadow_on and SUN[2] > 0.05 and explode < 0.4:
+            elif shadow_on and not nosun and SUN[2] > 0.05 and explode < 0.4:
                 for wv in world:
                     xs = [w[0] for w in wv]
                     ys = [w[1] for w in wv]
@@ -2283,15 +2890,44 @@ def main():
             # this model happens exclusively inside joints -- a bearing sunk
             # into a limb, a ram buried in a calf -- where the seam is hidden
             # by the very parts that create it.
-            sel_part = parts[sel] if (parts and not stl_mode) else None
+            sel_part = (parts[sel] if (parts and not stl_mode and sel >= 0)
+                        else None)
             SC = P['sel']
             fog0, fog1 = DIST - MRAD * 1.6, DIST + MRAD * 2.4
             fogc = P['sky'][1]
+            sil = [1e9, 1e9, -1e9, -1e9]        # silhouette box, screen px
             queue = []
+            # One bytearray per part, rebuilt whenever the part list changes,
+            # so a level-of-detail switch cannot be scored against the hull it
+            # is no longer drawing.
+            if scan_seen is None or len(scan_seen) != len(parts):
+                scan_seen = [bytearray(len(p.faces)) for p in parts]
+                scan_tot = sum(len(p.faces) for p in parts) or 1
+                scan_left = scan_tot
+                scan_sweep, scan_az = 0.0, az
+            # 'Every facet returned' is the wrong completion test and measuring
+            # it proved as much: it stalls around 96%, because at a fixed tilt
+            # some of the hull -- undersides, the inside of the shoulder --
+            # never turns to face the sensor at any bearing at all. A bar that
+            # asymptotes short of full is the loading-forever bar again.
+            #
+            # A full REVOLUTION is the test that terminates and that means
+            # something: the sensor has now seen the target from every bearing,
+            # and the coverage it reached is the fraction of hull a sweep at
+            # this elevation can return. What it missed is a fact about the
+            # geometry, not an unfinished job -- so the strip stops counting
+            # and reports the achieved figure.
+            scan_sweep += abs(az - scan_az)
+            scan_az = az
             for pi, p in enumerate(parts):
                 wv = world[pi]
                 M = p.frame.M
                 hot = p is sel_part and not zen
+                praw = p.temp if sensor == SENSOR_THERMAL else None
+                # On a loaded mesh the highlight is per FACET, not per part:
+                # one Part carries the whole shell and the selection is a
+                # section of it.
+                psec = p.sec if (stl_mode and not zen) else None
                 # Occlusion lives inside the per-face brightness multiplier, so
                 # toggling it is a choice of list, not a branch in the shader.
                 wr = p.wear if ao_on else p.wear_plain
@@ -2329,22 +2965,38 @@ def main():
                     p._nw, p._nw_M = nw, M
 
                 qa = queue.append
+                # Local, and only touched while the scan is incomplete: once
+                # it finishes this whole thing costs one `if scan_left` per
+                # facet, and the gather loop is the hot loop in this program.
+                pseen = scan_seen[pi]
                 for fi, (idx, mat, ln, lc) in enumerate(p.faces):
                     n = nw[fi]
+                    h = hot if psec is None else (psec[fi] == sel)
                     a = wv[idx[0]]
                     # Backface test against the eye, not against a global
                     # azimuth: under perspective the two disagree at the edges
-                    # of a wide model and the disagreement is a hole.
-                    if ((camX - a[0]) * n[0] + (camY - a[1]) * n[1] +
+                    # of a wide model and the disagreement is a hole. XRAY is
+                    # exactly the mode that wants the far side, so it is the
+                    # one mode that skips this.
+                    if see_through:
+                        pass
+                    elif ((camX - a[0]) * n[0] + (camY - a[1]) * n[1] +
                             (camZ - a[2]) * n[2]) <= 0.0:
                         continue
+                    if cutplane is not None and a[2] > cutplane:
+                        continue          # cutaway: nothing above the station
+                    if scan_left and not pseen[fi]:
+                        pseen[fi] = 1
+                        scan_left -= 1
+                    if praw is not None:
+                        h = praw[fi]      # thermal carries temperature, not select
                     if len(idx) == 3:
                         s0 = sp[idx[0]]
                         s1 = sp[idx[1]]
                         s2 = sp[idx[2]]
                         qa(((s0[2] + s1[2] + s2[2]) / 3,
                             ((s0[0], s0[1]), (s1[0], s1[1]), (s2[0], s2[1])),
-                            mat, n, wr[fi], hot))
+                            mat, n, wr[fi], h))
                         continue
                     zsum = 0.0
                     pts = []
@@ -2353,7 +3005,7 @@ def main():
                         pts.append((s[0], s[1]))
                         zsum += s[2]
                     zsum /= len(idx)
-                    qa((zsum, pts, mat, n, wr[fi], hot))
+                    qa((zsum, pts, mat, n, wr[fi], h))
 
             queue.sort(key=lambda q: -q[0])
             drawn = len(queue)
@@ -2377,10 +3029,67 @@ def main():
             rfill, rfill3 = ras.fill, ras.fill3
             lm = light_mode
 
+            if wireonly:
+                # A return, not a picture: brightness is range, and the only
+                # geometry drawn is the facet outline. Costs no fill at all,
+                # which is why these are the fastest channels in the program.
+                near, far = fog0, fog1
+                span = (far - near) or 1.0
+                wc0 = SCAN_COL
+                # View direction, good enough for a grazing test at this range.
+                vlen = math.sqrt(camX * camX + camY * camY + camZ * camZ) or 1.0
+                vdx, vdy, vdz = camX / vlen, camY / vlen, camZ / vlen
+                # The silhouette has to be accumulated here as well as in the
+                # fill loop. It was not, and the consequence was that the lock
+                # frame -- and, once the strip moved onto row 0, every readout
+                # on the display -- disappeared in precisely the two channels
+                # you would be scanning a target with. Over every queued facet,
+                # not just the contours: the box is the target's extent, which
+                # does not depend on which facets happen to graze the view.
+                for zsum, pts, mat, n, wear, hot in queue:
+                    for px_, py_ in pts:
+                        if px_ < sil[0]:
+                            sil[0] = px_
+                        if px_ > sil[2]:
+                            sil[2] = px_
+                        if py_ < sil[1]:
+                            sil[1] = py_
+                        if py_ > sil[3]:
+                            sil[3] = py_
+                    d = n[0] * vdx + n[1] * vdy + n[2] * vdz
+                    if d < 0.0:
+                        d = -d
+                    if d > SCAN_GRAZE:
+                        continue        # facing us: interior, not a contour
+                    g = 1.0 - (zsum - near) / span
+                    if g < 0.12:
+                        g = 0.12
+                    elif g > 1.0:
+                        g = 1.0
+                    if see_through:
+                        g *= 0.62
+                    if hot and psel_on:
+                        c = quant(lerp(shade(wc0, g), SC, 0.5))
+                    else:
+                        c = quant(shade(wc0, g))
+                    for i in range(len(pts)):
+                        a_, b_ = pts[i - 1], pts[i]
+                        ras.line_c(a_[0], a_[1], b_[0], b_[1], c)
+                queue = []
+
             for zsum, pts, mat, n, wear, hot in queue:
                 base = MAT[mat]
                 n0, n1, n2 = n
-                if lm == LIGHT_FLAT:
+                if sensor == SENSOR_THERMAL:
+                    # 'hot' carries temperature in this channel, not the
+                    # selection flag. The field is already smooth and already
+                    # normalised, so it goes on the ramp end to end -- the
+                    # earlier version had to squash it into the middle third
+                    # because raw per-facet occlusion swung hard between
+                    # neighbours and read as camouflage. A reactor does not.
+                    ti = int(hot * 64.0)
+                    base = HEAT_LUT[ti if 0 <= ti <= 64 else 0]
+                if lm == LIGHT_FLAT or sensor == SENSOR_THERMAL:
                     r, g, b = base
                 else:
                     ndl = n0 * S0 + n1 * S1 + n2 * S2
@@ -2420,7 +3129,7 @@ def main():
                         b = 255
                     elif b < 0:
                         b = 0
-                if lm == LIGHT_FULL:
+                if lm == LIGHT_FULL and sensor != SENSOR_THERMAL:
                     # Hemisphere ambient: an upward face is under the sky and
                     # takes the sky's colour, a downward face is over the ground
                     # and takes the ground's. This is what tells a horizontal
@@ -2447,18 +3156,26 @@ def main():
                         r = int(r + (fgr - r) * fog)
                         g = int(g + (fgg - g) * fog)
                         b = int(b + (fgb - b) * fog)
-                if hot:
+                if hot and psel_on:
                     r = int(r + (SCr - r) * 0.34)
                     g = int(g + (SCg - g) * 0.34)
                     b = int(b + (SCb - b) * 0.34)
                 # Gradient only where it can be seen -- see GRAD_MIN_H.
                 ylo = yhi = pts[0][1]
                 for pt in pts:
-                    py = pt[1]
+                    px_, py = pt
                     if py < ylo:
                         ylo = py
                     elif py > yhi:
                         yhi = py
+                    if px_ < sil[0]:
+                        sil[0] = px_
+                    elif px_ > sil[2]:
+                        sil[2] = px_
+                if ylo < sil[1]:
+                    sil[1] = ylo
+                if yhi > sil[3]:
+                    sil[3] = yhi
                 if yhi - ylo >= GRAD_MIN_H:
                     c = (r, g, b)
                     rfill(pts, quant(shade(c, 1.05)), quant(shade(c, 0.93)))
@@ -2489,25 +3206,124 @@ def main():
             if not zen:
                 total_mass = sum(p.mass for p in parts)
                 nfaces = sum(len(p.faces) for p in parts)
-                title = (' %s // mesh ' % os.path.basename(model_name)
-                         if stl_mode else ' MADCAT-X // structural model ')
                 otext(0, 0, ' ' * cols, H, PN)
-                otext(0, 1, title, P['sel'], PN)
-                right = (f' {math.degrees(az) % 360:5.1f}° az '
-                         f'{math.degrees(el):+5.1f}° el  d{DIST:.0f}  '
-                         f'{total_mass:.0f}t  {commas(nfaces)} facets  '
-                         f'{drawn} drawn  {fps_avg:4.1f}fps ')
-                otext(0, max(len(title) + 2, cols - len(right) - 1), right,
-                      H, PN)
+                # Row 0 is the instrument strip and nothing else. It used to
+                # carry a facet count and a draw count in the top right of a
+                # targeting display -- and they were painted over by the strip
+                # every frame anyway, so the only thing lost by deleting them
+                # is a line of dead code. Numbers about the renderer belong in
+                # the mesh panel, which is the page about the renderer.
                 if flash and now < flash_until:
                     otext(1, cols - len(flash) - 3, ' ' + flash + ' ',
                           PN, P['alert'])
 
-                if panel > 4 and stl_mode:
+                if panel > 4 and stl_mode and panel_mode == 0:
+                    # ---- combat page ----
+                    # Everything a gunner would want and nothing about the
+                    # renderer. Two sources and no third: the CANON table,
+                    # which is Sarna's, and the mesh, which is measured. Each
+                    # block says which it is, because the interesting cases
+                    # are the ones that mix them -- the armour distribution
+                    # below is twelve canon tons spread over measured skin.
                     rp = parts[0].model.report
                     for r in range(1, rows - 1):
                         otext(r, 0, ' ' * panel, H, PN)
-                    otext(1, 1, 'MESH', P['sel'], PN)
+                    W = panel - 2
+
+                    def field(r, k, v, hot=False):
+                        otext(r, 1, k[:panel - 3], HD, PN)
+                        otext(r, max(len(k) + 2, panel - 1 - len(v)), v,
+                              P['sel'] if hot else H, PN)
+
+                    lines = []          # (kind, a, b, hot)
+                    lines.append(('head', CANON['name'], '', False))
+                    lines.append(('text', '%s  %s' % (CANON['codename'],
+                                                      CANON['config']), '',
+                                  False))
+                    lines.append(('rule', '', '', False))
+                    lines.append(('kv', '%d t' % CANON['mass_t'],
+                                  CANON['origin'], False))
+                    lines.append(('blank', '', '', False))
+
+                    area = rp.get('sec_area') or []
+                    lines.append(('sec', 'ARMOUR', '%.1f t'
+                                  % CANON['armour_t'], False))
+                    lines.append(('dim', 'ferro-fibrous, by area', '', False))
+                    for si, sc in enumerate(SECTIONS):
+                        if si >= len(area):
+                            break
+                        t = area[si] * CANON['armour_t']
+                        lines.append(('bar', si, '%4.1f' % t, si == sel))
+                    lines.append(('blank', '', '', False))
+
+                    lines.append(('sec', 'LOADOUT', CANON['config'], False))
+                    for wn, wc in CANON['weapons']:
+                        lines.append(('wpn', wn, '%d' % wc, False))
+                    lines.append(('blank', '', '', False))
+
+                    lines.append(('sec', 'HEAT', '', False))
+                    lines.append(('kv', 'sinks', CANON['heatsinks'], False))
+                    lines.append(('kv', 'core', '375 XL', False))
+                    lines.append(('blank', '', '', False))
+                    lines.append(('sec', 'MOBILITY', '', False))
+                    lines.append(('kv', 'walk %d' % CANON['walk_mp'],
+                                  '%.1f km/h' % CANON['cruise'], False))
+                    lines.append(('kv', 'run %d' % CANON['run_mp'],
+                                  '%.1f km/h' % CANON['flank'], False))
+                    lines.append(('blank', '', '', False))
+                    lines.append(('sec', 'AIRFRAME', '', False))
+                    lines.append(('dim', CANON['chassis'], '', False))
+                    lines.append(('dim', CANON['engine'], '', False))
+                    lines.append(('kv', 'pod space', '%.1f t'
+                                  % CANON['podspace'], False))
+                    lines.append(('blank', '', '', False))
+                    lines.append(('sec', 'QUIRK', '', False))
+                    lines.append(('dim', CANON['quirk'], '', False))
+
+                    # Ordered by what a gunner needs first, then simply cut to
+                    # fit: a short terminal loses the airframe trivia, not the
+                    # armour spread.
+                    amax = max(area) if area else 1.0
+                    rr = 1
+                    for kind, a, b, hotl in lines:
+                        if rr >= rows - 2:
+                            break
+                        if kind == 'head':
+                            otext(rr, 1, a[:W], P['sel'], PN)
+                        elif kind == 'rule':
+                            otext(rr, 1, '─' * W, HD, PN)
+                        elif kind == 'sec':
+                            otext(rr, 1, ('%s %s' % (a, '─' * W))[:W - len(b)
+                                                                  - 1],
+                                  H, PN)
+                            if b:
+                                otext(rr, panel - 1 - len(b), b, P['sel'], PN)
+                        elif kind == 'text':
+                            otext(rr, 1, a[:W], H, PN)
+                        elif kind == 'dim':
+                            otext(rr, 1, a[:W], HD, PN)
+                        elif kind == 'kv':
+                            field(rr, a, b, hotl)
+                        elif kind == 'wpn':
+                            otext(rr, 1, ('%sx ' % b) + a[:W - 3], H, PN)
+                        elif kind == 'bar':
+                            otext(rr, 1,
+                                  ('▸' if hotl else ' ')
+                                  + SECTION_NAMES[SECTIONS[a]][:8],
+                                  P['sel'] if hotl else H, PN)
+                            if panel >= 22:
+                                otext(rr, panel - 12,
+                                      bar_str(area[a] / amax, 6), HD, PN)
+                            otext(rr, panel - 5, b + ' t',
+                                  P['sel'] if hotl else HD, PN)
+                        rr += 1
+                elif panel > 4 and stl_mode:
+                    # ---- mesh page ----
+                    rp = parts[0].model.report
+                    for r in range(1, rows - 1):
+                        otext(r, 0, ' ' * panel, H, PN)
+                    otext(1, 1, os.path.basename(model_name)[:panel - 2],
+                          P['sel'], PN)
                     otext(2, 1, '─' * (panel - 2), HD, PN)
 
                     def field(r, k, v, hot=False):
@@ -2535,6 +3351,8 @@ def main():
                             ('height', '%.1f m' % MODEL_H),
                             ('volume', '%.1f m³' % rp['built_volume']),
                             ('mass', '%.1f t' % rp['built_mass']),
+                            ('drawn', commas(drawn)),
+                            ('fps', '%.1f' % fps_avg),
                             ('', ''),
                             ('occlusion', 'on' if ao_on else 'off'),
                             ('ao reach', '%g vox' % rp['ao_radius']),
@@ -2572,7 +3390,7 @@ def main():
                         otext(r, panel - 5, '%4.1f' % p.mass,
                               P['sel'] if cur else HD, PN)
                         r += 1
-                    if parts:
+                    if parts and sel >= 0:
                         p = parts[sel]
                         otext(rows - 4, 1, '─' * (panel - 2), HD, PN)
                         otext(rows - 3, 1, p.name[:panel - 2], P['sel'], PN)
@@ -2582,8 +3400,8 @@ def main():
                         otext(rows - 5, 1, '%-*s%5.1f t'
                               % (panel - 8, 'TOTAL', total_mass), H, PN)
 
-                hint = (' SPACE pause  <-> orbit  ^v tilt  [] zoom  '
-                        + ('d detail  a occlusion  w wire  '
+                hint = (' <-> orbit  ^v tilt  [] zoom  v sensor  '
+                        + ('jk target  c cutaway  m panel  d detail  '
                            if stl_mode else 'jk part  e explode  ')
                         + 'p palette  h help  q quit ')
                 otext(rows - 1, 0, ' ' * cols, HD, PN)
@@ -2601,6 +3419,78 @@ def main():
                         if 1 <= r0 < rows - 1 and c0 > panel:
                             otext(r0, c0, p.name,
                                   P['sel'] if pi == sel else H, None)
+
+            # ---- targeting frame ----
+            # Brackets track the model's real projected silhouette, which the
+            # fill loop already measured facet by facet -- not a guess from the
+            # bounding sphere, so they tighten on the legs when the arms swing
+            # out of frame under the cutaway.
+            if not zen and sil[2] > sil[0]:
+                bc0 = max(panel, int(sil[0] / SUBX) - 1)
+                bc1 = min(cols - 2, int(sil[2] / SUBX) + 1)
+                br0 = max(1, int(sil[1] / 2) - 1)
+                br1 = min(rows - 3, int(sil[3] / 2) + 1)
+                locked = (now - t0) > 1.2
+                BR = H if locked else HD
+                arm = max(2, min(6, (bc1 - bc0) // 4))
+                vrm = max(1, min(3, (br1 - br0) // 4))
+                if bc1 > bc0 and br1 > br0:
+                    otext(br0, bc0, '┏' + '━' * (arm - 1), BR)
+                    otext(br0, bc1 - arm + 1, '━' * (arm - 1) + '┓', BR)
+                    otext(br1, bc0, '┗' + '━' * (arm - 1), BR)
+                    otext(br1, bc1 - arm + 1, '━' * (arm - 1) + '┛', BR)
+                    for rr in range(1, vrm + 1):
+                        otext(br0 + rr, bc0, '┃', BR)
+                        otext(br0 + rr, bc1, '┃', BR)
+                        otext(br1 - rr, bc0, '┃', BR)
+                        otext(br1 - rr, bc1, '┃', BR)
+                    mc = (bc0 + bc1) // 2
+                    mr = (br0 + br1) // 2
+                    otext(mr, mc - 1, '─┼─', BR)
+                    tag = ' %s %s ' % (CANON['codename'],
+                                       'LOCK' if locked else 'ACQ')
+                    otext(max(0, br0 - 1), mc - len(tag) // 2, tag,
+                          P['sel'] if locked else HD, PN)
+
+                # ---- instrument strip ----
+                # The scan bar was a barber pole -- (sim * 0.7) % 1.0 -- and
+                # it loaded forever and meant nothing. It now reports sensor
+                # COVERAGE: the fraction of the hull's facets that have come
+                # round far enough to return at least once. It fills as the
+                # target turns, it reaches 100%, and then it says so and stops.
+                # XRAY completes almost at once, which is correct: that is the
+                # channel that does not need the far side to turn towards you.
+                rng = DIST
+                brg = math.degrees(az) % 360.0
+                elv = math.degrees(el)
+                rpt = lods[lod_i].model.report if (stl_mode and lods) else None
+                if rpt and 0 <= sel < len(SECTIONS):
+                    share = rpt.get('sec_share') or []
+                    smass = ((share[sel] if sel < len(share) else 0.0)
+                             * rpt['built_mass'])
+                    sname = SECTION_NAMES[SECTIONS[sel]].upper()
+                    starg = '%-6s %5.1f t' % (sname, smass)
+                elif rpt:
+                    starg = '%-6s %5.1f t' % ('HULL', rpt['built_mass'])
+                else:
+                    starg = '%-6s' % ('--' if sel < 0 else parts[sel].name[:6])
+                cov = 1.0 - scan_left / float(scan_tot or 1)
+                if scan_sweep < 2.0 * math.pi and scan_left:
+                    scantxt = 'SCAN %s %3d%%' % (
+                        bar_str(scan_sweep / (2.0 * math.pi), 8),
+                        int(cov * 100.0))
+                else:
+                    scantxt = 'SWEPT 360°  %3d%%' % int(cov * 100.0)
+                # Target before bearing: at 80 columns the strip runs off
+                # the right-hand edge, and what a gunner loses last is what
+                # they are shooting at, not the elevation readout.
+                strip = ('MK-VII  %-7s  %-18s  TGT %s   BRG %05.1f  '
+                         'EL %+05.1f  RNG %05.1f m'
+                         % (SENSOR_NAMES[sensor], scantxt, starg, brg, elv,
+                            rng))
+                otext(0, 0, ' ' * cols, HD, PN)
+                otext(0, 1, strip[:cols - 2], H,
+                      PN)
 
             if show_help:
                 bw = min(cols - 4, 66)

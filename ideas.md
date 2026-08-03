@@ -616,6 +616,194 @@ ms, about 3%; the cast shadow was never the problem.
 
 Still on the table, unmeasured: the emitter is 15% at 240×70 and untouched.
 
+#### Segmenting the mesh into the machine's own limbs
+
+The mesh is the Timber Wolf, Inner Sphere codename Mad Cat, and **the fiction is
+not mine to invent — [Sarna](https://www.sarna.net/wiki/Timber_Wolf_(Mad_Cat)) is
+the authority.** That is a working rule, not a courtesy: an earlier draft of this
+program stated that the ER large lasers sit in the arms and the LRM-20s in the
+side torsos. Sarna lists the Prime's nine weapons and assigns **none** of them a
+body location. The placement was the kind of thing everyone knows and nobody
+sourced. The `CANON` table now carries only sourced fields and deliberately has
+no weapon locations in it.
+
+The same rule inverted the mass model, for the better. Mass used to be 65 t of
+hand-calibrated guesswork times a guessed 0.31 t/m³ density. Now **Sarna owns
+the tonnage (75 t) and the mesh owns the geometry**, and the density is the
+*derived* figure: 75 t ÷ 138.6 m³ = 0.541 t/m³. Each side supplies only what it
+actually knows.
+
+BattleTech also hands over the target set — HD, CT, LT, RT, LA, RA, LL, RL — so
+nothing had to be invented there either. Two approaches, and the first one
+failed:
+
+- **Slice topology (a Reeb graph of the height function).** Connected components
+  per horizontal slice, linked between slices. Found the legs and the LRM pods
+  cleanly and **failed on the arms**: 2.9% of the hull against 0.9%, with 65% of
+  the machine dumped in the torso. Above the hips an arm and the torso side land
+  in the *same* 2D component wherever they overlap in plan view.
+- **Erosion + watershed.** A mech's joints are its narrow places, so erosion
+  breaks them first and the limbs fall off on their own. Erode to a core, take 3D
+  connected components as seeds, then flood all seeds simultaneously back over
+  the solid — the boundary lands in the joint where it belongs.
+
+Three things had to be measured rather than assumed:
+
+**The mirror plane.** The obvious shortcut — lateral axis = whichever way the
+legs are furthest apart — is a *coin flip* here: the Mad Cat is modelled
+mid-stride and its legs are separated diagonally, 35.3 grid units one way against
+38.1 the other. Searching for the plane that best maps the solid onto itself
+gives 21°, scoring 0.686 against a worst case of 0.327 — and correctly not 1.0,
+because the stride is real. That also yields the facing direction, which the
+aspect-angle readout will want.
+
+**Erosion depth is not a constant.** At 96³ a depth of 6 parts the limbs; at the
+default 80³ the same depth erases them and leaves two lumps. So it is swept, and
+**bilateral symmetry decides**: the right depth is the deepest that still finds
+two outboard components on *each* side of the mirror plane. Nothing in the search
+knows the machine is symmetric, so when the answer comes out symmetric that is
+evidence, not assumption.
+
+**Pick per side, never globally.** "The two largest remaining components" chose
+two pieces off the same shoulder and left the other arm unlabelled.
+
+Then a self-inflicted one worth recording. Per-section volume was first computed
+as signed tetrahedron fans, on the argument that the divergence theorem would
+absorb the open boundary. **It does not** — the fan integral is volume only for a
+*closed* surface, and for an open patch the answer depends on where the rim sits
+relative to the origin. The symptom was the arms coming out 3.1 m³ against 5.8 m³
+while their facet counts agreed to within 4%. Counting labelled voxels is a true
+partition and has no such problem: arms 8.7 / 8.8 m³, legs 16.9 / 16.9, torso
+87.3, summing to the measured 138.6.
+
+Also fixed: `built_volume` moved with the detail level (142.4 m³ at low against
+138.8 at high) because the normalising scale was taken from the *decimated*
+bounding box, which decimation pulls inward. The source owns the height; a level
+of detail does not get a vote on how big the machine is.
+
+`j`/`k` are alive again on a loaded mesh — they cycle the five sections and the
+selection highlights on the model, which is the only check that the labels landed
+on the right *geometry* rather than merely plausible percentages. `e` (explode)
+and `i` (idle) are still inert on a mesh.
+
+#### The targeting HUD: sensor channels, lock frame, cutaway
+
+Four sensor channels on `v`, each asking a different question of the same mesh
+and each answering it from something already measured:
+
+- **OPTICAL** — the lit hull.
+- **THERMAL** — false colour from ambient occlusion. Occlusion measures how
+  enclosed a facet is, and an enclosed facet is one heat cannot leave, so deep
+  joints read hot and open plate reads cold. A real property of the geometry,
+  not a gradient painted over a picture.
+- **LIDAR / XRAY** — contours on a dark instrument field; XRAY additionally
+  keeps the far side of the hull by being the one channel that skips the
+  backface test.
+
+Two things that had to be *looked at* before they worked, neither of which any
+timing or unit test would have caught:
+
+**Outlining every facet shows nothing.** The first wireframe drew all ~6,000
+triangle edges and produced an illegible scribble that filled the silhouette.
+The fix is to draw only facets grazing the view — `|n·view| < 0.42` — which
+traces contours instead of a mesh. That is the difference between a wireframe
+and a scan return.
+
+**A sensor channel must not render sunlight.** The first version kept the sky
+gradient, the daylit ground and the hard cast sun shadow behind a lidar trace,
+and drew the trace in the palette's grid olive — olive lines on olive ground.
+There is no sun in a lidar return: scan channels now clear to a dark field,
+skip the shadow and the ground fill, and use a fixed phosphor that no palette
+can override. Same reasoning as the heat ramp: an instrument that changes
+colour when you press `p` is decoration.
+
+Thermal needed its ramp compressed into the middle too — raw per-facet
+occlusion swings hard between neighbours and across the full ramp it read as
+camouflage rather than heat.
+
+The lock brackets track the model's **real projected silhouette**, accumulated
+facet by facet in the fill loop rather than guessed from the bounding sphere.
+That is why they tighten correctly onto the legs when the cutaway removes the
+upper body — which is the visible proof the number is real.
+
+Cost, at 160×48: lidar 13.6 ms, thermal 15.3, optical 19.5, xray 21.0. The scan
+channels are the fastest things the program draws because they never fill.
+
+Open: the cutaway **clips**, it does not cap. A true cross-section wants the
+occupancy grid kept at runtime so the cut face can be filled from solid cells
+and coloured by section — which would also give cross-sectional area as a real
+number. The grid is currently discarded after load.
+
+#### What the HUD was still getting wrong
+
+The first pass built the four features and got the *display* wrong in five ways
+at once, all of which came back as one round of feedback and all of which were
+fair.
+
+**The panel was a build report in a cockpit.** Source triangle count, welded
+vertices, decimation error, watertight. Every one of those is a number about
+the renderer, and none of them is a number about the machine you have just
+targeted. They moved to a MESH panel behind `m`, and the default panel is now
+armour, loadout, heat sinks, speeds and quirk.
+
+The interesting question was where the armour figures come from, because Sarna
+gives twelve tons of ferro-fibrous and **no per-location table** — I checked
+the page and searched the wiki specifically for it. So the panel spreads the
+canon twelve tons over the *measured skin area* of each segmented section and
+says so on the line beneath. Area, not volume: armour is a skin. Distributing
+by volume would have been the easier change and quietly wrong, because an arm
+has far more surface per cubic metre than the torso — 6.9% of the skin against
+6.3% of the displacement, which is a real difference in tonnage.
+
+**The scan bar loaded forever.** It was `(sim * 0.7) % 1.0` — a barber pole. It
+now counts real sensor coverage: a byte per facet, set the first time that
+facet survives the backface test. That gave a bar that *filled* honestly and
+then stalled at 96% and still never finished, because at a fixed tilt part of
+the hull never turns to face the sensor at any bearing at all. So the
+completion test is a full **revolution** of bearing, which terminates and means
+something, and the coverage figure is reported alongside as the fraction a
+sweep at this elevation can return. XRAY reaches 100%, which is the check that
+the number is measuring what it claims: that is the one channel that does not
+need the far side to turn towards you.
+
+**Thermal was measuring the wrong quantity.** It false-coloured ambient
+occlusion, on the argument that an enclosed facet is one heat cannot leave.
+That is true, but it is the *trapping* term — and the machine is built around
+a Starfire 375 XL, so the reactor is hotter than everything else put together
+and the display was painting a cold torso. It now has a point source at the
+**measured centroid of the torso section**, falling off as an inverse square,
+with occlusion kept as the weaker second term. Torso mean 0.53 peaking at 1.00,
+arms 0.29, legs 0.21, feet coldest at 0.05 — and the two sides agree to within
+0.02, which is a free symmetry check on the segmentation as well.
+
+The built-in mech got the same treatment, because without a heat field its
+per-facet slot still held the *selection* flag, so picking a part in THERMAL
+made it read white-hot.
+
+**Two bugs found only by looking.** The lock frame's silhouette box was
+accumulated in the fill loop only, so in LIDAR and XRAY — the channels you
+would actually scan with — it stayed empty and the whole targeting frame
+vanished. Once the instrument strip moved to own row 0, that took every readout
+on the display with it. And THERMAL was still drawing a blue sky, daylit olive
+ground and a hard sun shadow: I had gated all of that on `wireonly` rather than
+on "is this an instrument channel", so I fixed the sunlight for two of the
+three sensor channels and left it in the third.
+
+**No target is a state.** `j`/`k` cycle through −1, so you can look at the whole
+machine with nothing highlighted, which is where the program now starts.
+
+**The help was a page and a half of prose.** It is a key table now. The prose
+that was worth keeping went into the docstring and into comments beside the
+things they describe; the rest was explaining decisions to someone who had not
+asked.
+
+Open: the torso is one 60% lump by request — CT/LT/RT is a later job. HD will not
+come from topology at all, since the Mad Cat's cockpit is a canopy faired into the
+torso and never becomes its own component; it needs a geometric rule and should be
+labelled as one. And `--builtin` still reports "MADCAT-X, 65.44 t", which is *my*
+procedural invention and not the canonical machine — it should stop borrowing the
+name.
+
 ## Not built yet
 
 ### 1. Falling-code rain, fed from something real
