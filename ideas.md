@@ -827,6 +827,142 @@ a hand-counted column, which is the fix that stays fixed.
 
 All of it is behind `f`, and `--no-chrome` starts without it.
 
+#### Two sensors with one picture, a scan that did nothing, and a paper doll
+
+**LIDAR and XRAY were the same instrument twice.** Both drew grazing-angle
+contours; XRAY only added the far side at 62% brightness, which on a mostly
+convex hull lands *inside* the silhouette and reads as noise. Two channels that
+produce the same image are one channel with two names.
+
+They now answer different questions. LIDAR is a **range return**, so it is
+drawn as one: a point per vertex and centroid of every facet the beam reaches,
+brightness by range and by how square the facet sits to the beam. No contour
+filter — a point cloud does not scribble the way six thousand outlines did, and
+the density thinning around the curve of the hull *is* the shape of the return.
+XRAY **inverts**: the near skin drops to a faint ghost and the far side is
+drawn bright, which is the whole meaning of the channel — you are looking
+through the front of the machine at the inside of its back — with the reactor
+marked, because on a diagnostic x-ray the power plant is the one thing you
+could not miss.
+
+The free information that made the inversion possible was already there and
+being thrown away: the grazing test took `abs(n·v)`, and the *sign* of that dot
+is exactly near-side versus far-side.
+
+Measured, and it changed the design: drawing every back-facing outline in full
+cost 32.5 ms/frame against the old channel's 22.8, and **67 ms at high detail**
+— fifteen frames a second for a display whose whole job is to be ambient. The
+inversion is what carries the meaning, not the density, so the far side got the
+same grazing filter as the near. 23.4 ms, and it still reads as an x-ray.
+
+**The scan now drives the picture.** Two things happen while the bearing
+sweeps. A bright line runs down the target and holds back the geometry it has
+not reached (compared in *screen* space — at these tilts a horizontal world
+plane projects to within a pixel of a horizontal screen line, and screen space
+costs two comparisons against numbers the fill loop already computed for the
+gradient test). And the level of detail **steps up twice** as the sweep
+progresses: the sensor cannot resolve what it has not looked at yet, so the
+mesh starts coarse and earns its way to full. Naming a level with `--lod`, or
+pressing `d`, takes manual control — an automatic that overrides a deliberate
+keypress is a bug.
+
+That block had to move *ahead* of the world transform. It can swap the level of
+detail, and `world` is built from `parts`; changing one after the other has
+been computed leaves the two indexed against different meshes.
+
+**The paper doll is taken off the mesh, not drawn.** An orthographic projection
+of the hull onto the plane the mirror search found, with a depth buffer so each
+cell keeps whatever section is nearest the viewer. So the outline is *this*
+machine's silhouette — the shoulder pods, the gap between the legs, the forward
+hunch — and the regions on it are the same measured sections the panel quotes
+tonnages for. Facets are sampled at their vertices and centroid rather than
+scan-converted: at sixteen cells across there are nineteen facets per cell, so
+rasterising each one is a lot of arithmetic to reach the same answer.
+
+Which way round the machine is facing is still unresolved — the mirror plane
+gives the axis but not its sign — so this may be the back view, and nothing on
+it is labelled FRONT.
+
+Two look-only fixes. Drawn over the render with a transparent background it was
+illegible: olive hull showing through every gap turned the diagram into
+camouflage, so it got a bezel. And the unselected-section dim was set to 0.46
+against the *wrong* background — on the dark bezel that came out at (69,77,86),
+which reads as a hole in the silhouette rather than as a part you are not
+aiming at.
+
+**The startup sequence** runs inside the frame loop rather than as a blocking
+prologue, which means the last half second can wipe the panel away and reveal a
+display that has been turning behind it the whole time, and nothing has to be
+special-cased in the signal teardown. The numbers on it are this run's real
+ones — facet count, watertightness, grid size, solid cells, sections found,
+whether the reactor trace located — so the POST reports on work that actually
+happened. Any key skips it; `b` replays it.
+
+#### Where the frame time actually went
+
+The sweep-driven level of detail was scrapped: stepping up to LOD HIGH looked
+right and cost 36 ms/frame optical and 49 ms xray against 20 and 23 at medium,
+which is not a price an ambient display gets to charge. Medium is the default
+again and the wipe stays, because the wipe was the part that was free. The
+paper doll came out too.
+
+Then the profile, at the frame loop's own stage boundaries:
+
+| stage | LOD 1 @200x60 | LOD 2 @200x60 |
+|---|---|---|
+| shade | 12.31 ms (51%) | 22.32 ms (53%) |
+| gather | 4.02 | 9.95 |
+| paint | 4.64 | 4.70 |
+| **total** | **24.02** | **41.87** |
+
+**The shader was recomputing constants.** The lights are world-fixed and the
+turntable moves the *eye*, so for a facet that has not moved, `n·SUN`, `n·FILL`,
+the sheen, the hemisphere ambient and the weathering are all exactly the
+numbers they were last frame. Only fog (range) and the selection tint actually
+vary. The lit colour is now cached against everything it genuinely depends on
+— frame matrix, lighting mode, palette, occlusion toggle, sensor — and the
+per-frame shader is fog, tint and fill. The same reasoning then applied one
+stage earlier: on a loaded mesh the world-vertex transform produced the same
+five thousand vertices every frame.
+
+Three smaller ones, all in the hottest loop. The silhouette box lived in four
+*list slots* updated eight times per facet — it now lives in four locals and is
+written back once. The gather loop unpacked `(idx, mat, ln, lc)` per facet and
+used one of the four. And screen positions were `(x, y, z)` triples, so every
+facet built three fresh `(x, y)` pairs plus a tuple to hold them: five
+allocations where two will do, fixed by splitting depth into its own list.
+
+| | before | after |
+|---|---|---|
+| LOD 1 @200x60 | 24.02 ms | **18.12** (−25%) |
+| LOD 2 @200x60 | 41.87 ms | **28.96** (−31%) |
+| LOD 1 @80x24 | — | **9.76** |
+
+All of it **pixel-identical**, each step proven against the step before it
+across six lighting/sensor/palette combinations at two sizes.
+
+Two things the harness caught that mattered more than the timings.
+
+First, the control run failed — new against *new* scored 12/55 on some cases.
+The chrome carries a `T+MM:SS` mission clock off the wall clock and a REC lamp
+blinking on `now % 1.4`, so two runs a second apart differ in the top row no
+matter what the renderer does. This is the second time in this file that a
+control run has been the thing that saved the measurement, and it is now the
+first thing the harness prints.
+
+Second, with the clock excluded, five frames still differed at 200x60 — and it
+was the lock brackets, which brightened 1.2 s after the *process started*. That
+meant the sight said LOCK before the sensor had seen the far side of the
+target, and the frame it changed on depended on how fast the host happened to
+be running. Lock now follows the sweep. A performance harness found a design
+bug, which is not what it was for.
+
+Finally, the failure mode for a cache is not wrong arithmetic, it is an
+incomplete key. So a build that drops every cache at the top of each frame --
+semantically the uncached renderer -- was compared against the real one with
+the pose *moving*, since a static pose can hide a missing key by never changing
+the thing the key forgot. Identical on all six cases.
+
 Open: the torso is one 60% lump by request — CT/LT/RT is a later job. HD will not
 come from topology at all, since the Mad Cat's cockpit is a canopy faired into the
 torso and never becomes its own component; it needs a geometric rule and should be

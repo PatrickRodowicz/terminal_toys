@@ -42,6 +42,11 @@
  the wrong test -- it stalls near 96%, because at a fixed tilt some of the hull
  never faces the sensor at any bearing.
 
+ The sweep drives what you see. A bright line runs down the target and holds
+ back the geometry it has not reached, and the level of detail steps up twice
+ as the bearing comes round -- the sensor cannot resolve what it has not looked
+ at yet. --lod or pressing d takes manual control and stops the progression.
+
  With --builtin, or with no STL to hand, it draws a mech assembled here out of
  lofted convex hulls on a 17-bone skeleton -- articulated, so j and k walk the
  structure list and e pulls it apart.
@@ -57,18 +62,21 @@
    python3 mechmodel.py --lighting key  cheaper shading, still solid-looking
    (also --tilt --az --dist --speed --fps --blocks --zen --lod --voxels
     --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames
-    --no-chrome --seed)
+    --no-chrome --no-boot --seed)
 
  Live controls (h for the full list):
-   f     cockpit chrome: boresight, viewport frame, and a bearing tape and
-         elevation ladder driven by the camera's real azimuth and tilt.
+   f     cockpit chrome: viewport frame, and a bearing tape and elevation
+         ladder driven by the camera's real azimuth and tilt.
+   b     replay the startup sequence.
    m     panel: combat / mesh
    j k   target section -- NO TARGET, torso, arm L/R, leg L/R. The sections
          are segmented off the occupancy grid; see SECTIONS.
    SPACE pause spin   q quit         h help        0 reset
    <- -> orbit        ^ v tilt       [ ] zoom      , . spin rate
    d     detail       a occlusion    w wireframe   l labels   S shadow
-   v     sensor: optical / thermal / lidar / xray
+   v     sensor: optical / thermal / lidar / xray. LIDAR is a range return
+         drawn as a point cloud; XRAY drops the near skin to a ghost and
+         draws the far side bright, with the reactor marked.
    c     cutaway plane, - and = to move the station
    L     lighting: full / key / flat -- key drops the fill light, sheen,
          ambient and fog; flat drops lighting altogether, which on a
@@ -80,6 +88,9 @@
 import sys, os, math, time, shutil, argparse, signal, random, select
 import colorsys, struct, array, json, zlib
 from collections import deque
+from operator import itemgetter
+
+_getdepth = itemgetter(0)
 
 # --- ANSI -----------------------------------------------------------------
 ESC = '\033['
@@ -911,6 +922,32 @@ for _i in range(65):
 # olive, which on the daylit field put olive lines over olive ground.
 SCAN_COL = (150, 232, 198)
 SCAN_BG = (10, 14, 18)
+# XRAY draws the far side bright and the near skin as a ghost, so the two need
+# to be separable at a glance; and the reactor gets its own colour because it
+# is the one thing on a diagnostic x-ray you could not possibly miss.
+# The acquisition wipe: while the sensor is still sweeping, a bright line runs
+# down the target and the geometry it has not reached yet is held back. The
+# line is compared in SCREEN space rather than world space -- at these tilts a
+# horizontal world plane projects to within a pixel of a horizontal screen
+# line, and doing it in screen space costs two comparisons against numbers the
+# fill loop has already computed for the gradient test.
+# --- boot sequence ----------------------------------------------------------
+# A cold start for the sight. It is drawn INSIDE the frame loop rather than as
+# a blocking prologue: the renderer is already running behind it, so the last
+# half second can wipe the panel away and reveal a display that is already
+# turning, and nothing has to be special-cased in the signal teardown.
+#
+# The numbers on it are the real ones from this run's load -- facet count,
+# grid size, solid cells, sections found -- so the POST is reporting on work
+# that actually happened rather than reciting a script.
+BOOT_LINE_DT = 0.16       # seconds between lines
+BOOT_HOLD = 0.85          # pause on the completed list
+BOOT_WIPE = 0.55          # the reveal
+WIPE_PERIOD = 2.1        # seconds for one pass down the frame
+WIPE_BAND = 3.0          # pixels either side of the line that read as the edge
+WIPE_HELD = 0.46         # brightness of geometry the wipe has not reached
+XRAY_FAR = (176, 208, 255)
+XRAY_CORE = (255, 232, 150)
 SCAN_GRAZE = 0.42        # |n . view| below this is a contour, and only those
                          # get drawn -- outlining all 6,000 facets fills the
                          # silhouette with scribble and shows nothing.
@@ -973,7 +1010,7 @@ MODEL_H = 12.0            # world height every loaded model is normalised to
 LOD_TARGETS = (2600, 6200, 14000)
 LOD_NAMES = ('LOD LOW', 'LOD MEDIUM', 'LOD HIGH')
 CACHE_MAGIC = b'MMSH'
-CACHE_VER = 7
+CACHE_VER = 8
 CACHE_HEAD = '<HHIIId'
 CACHE_HLEN = len(CACHE_MAGIC) + struct.calcsize(CACHE_HEAD)
 SHADOW_BANDS = 14
@@ -1491,8 +1528,18 @@ def normalise(verts, up='z'):
     cy = (min(ys) + max(ys)) / 2.0
     z0 = min(zs)
     k = MODEL_H / ((max(zs) - z0) or 1.0)
-    return [((v[0] - cx) * k, (v[1] - cy) * k, (v[2] - z0) * k)
-            for v in verts], k
+    # The transform comes back as well as the vertices. Anything measured in
+    # source coordinates -- the reactor point, so far -- has to be able to
+    # follow the mesh into model space, and re-deriving the mapping at the
+    # call site is how the two quietly drift apart.
+    return ([((v[0] - cx) * k, (v[1] - cy) * k, (v[2] - z0) * k)
+             for v in verts], k, (cx, cy, z0, k, up))
+
+
+def apply_norm(p, xf):
+    cx, cy, z0, k, up = xf
+    x, y, z = (p[0], -p[2], p[1]) if up == 'y' else p
+    return ((x - cx) * k, (y - cy) * k, (z - z0) * k)
 
 
 # --- segmentation -----------------------------------------------------------
@@ -1796,7 +1843,7 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
     the decimated vertices have not been moved yet -- so the two never have to
     agree on a transform."""
     (solid, dims, org, s, shell, sol, sealed, vox, seclab, seccount,
-     core) = grid
+     core, _lat) = grid
     if note:
         note('decimating %s facets to %s' % (commas(len(tris)), commas(target)))
     verts, faces, ncell = decimate_to(tris, target)
@@ -1822,7 +1869,8 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
     src_h_raw = ((src['bbox'][1] if up == 'y' else src['bbox'][2])
                  if src.get('bbox') else 0.0) or 1.0
     temp = heat_field(verts, faces, ao, core, src_h_raw)
-    verts, scale = normalise(verts, up)
+    verts, scale, xf = normalise(verts, up)
+    reactor_m = apply_norm(core, xf) if core else None
     # Scale must come from the SOURCE height, not the decimated one. Decimation
     # pulls the extreme vertices in slightly, so a per-LOD scale made the
     # machine's displacement -- and now its derived density -- change every
@@ -1889,6 +1937,9 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
         'sec_share': _section_share(seccount),
         'sec_area': sec_area,
         'reactor': list(core) if core else None,
+        # ...and the same point in model space, which is where the XRAY
+        # channel has to draw it.
+        'reactor_m': list(reactor_m) if reactor_m else None,
         'lod_volume': dvol, 'lod_area': darea,
         'vol_err': (dvol / (src['volume'] * scale ** 3) - 1.0) * 100.0
                    if src.get('volume') else 0.0,
@@ -1997,12 +2048,12 @@ def load_models(path, targets, up='z', ao_radius=4.0, vox=80, note=None,
                 grid = voxel_solid(tris, vox, want_volume=src['volume']) + (vox,)
                 if note:
                     note('segmenting limbs')
-                seclab, seccount, _mir = segment_solid(grid[0], grid[1], note)
+                seclab, seccount, mir = segment_solid(grid[0], grid[1], note)
                 # Where the reactor is: the centroid of the torso's own mass,
                 # measured, not sited by hand. The thermal channel needs it.
                 core = section_centroid(seclab, grid[1], grid[2], grid[3],
                                         SECTIONS.index('TORSO'))
-                grid = grid + (seclab, seccount, core)
+                grid = grid + (seclab, seccount, core, (mir[0], mir[1]))
             m = build_model(tris, src, t, up, ao_radius, grid, note)
             if use_cache:
                 _cache_write(cp, m, mtime)
@@ -2313,13 +2364,14 @@ HELP = [
     '[ ]    zoom               j k    target section',
     ', .    spin rate          m      panel: combat/mesh',
     'd      detail             f      cockpit chrome',
-    'a      occlusion          l      labels',
-    'w      wireframe          L      lighting',
+    'a      occlusion          b      replay startup',
+    'w      wireframe          l      labels',
     'g      grid               S      cast shadow',
-    's      starfield          p 1-6  palette',
-    'i      idle animation     e      exploded view',
-    '0      reset              z      zen (hide HUD)',
-    'h      this help          q      quit',
+    's      starfield          L      lighting',
+    'i      idle animation     p 1-6  palette',
+    'e      exploded view      z      zen (hide HUD)',
+    '0      reset              h      this help',
+    'q      quit',
 ]
 
 
@@ -2355,6 +2407,8 @@ def main():
     ap.add_argument('--no-stars', action='store_true')
     ap.add_argument('--no-shadow', action='store_true')
     ap.add_argument('--no-idle', action='store_true')
+    ap.add_argument('--no-boot', action='store_true',
+                    help='skip the startup sequence (b replays it)')
     ap.add_argument('--no-chrome', action='store_true',
                     help='start with the cockpit chrome off (f toggles it)')
     ap.add_argument('--seed', type=int, default=None,
@@ -2540,6 +2594,8 @@ def main():
     explode_t = 0.0
     sel = -1              # -1 is NO TARGET, and it is the state you start in
     chrome = not args.no_chrome
+    boot_t0 = None
+    booting = not args.no_boot
     crng = random.Random(args.seed)
     callsign = '%s-%d' % (crng.choice(UNIT_CALLS), crng.randint(1, 6))
     pilot = crng.choice(PILOT_CALLS)
@@ -2590,7 +2646,11 @@ def main():
     FIT_RING = [(math.cos(a * math.pi / 8), math.sin(a * math.pi / 8))
                 for a in range(16)]
     stl_mode = bool(lods)
-    lod_i = min(args.lod, len(lods) - 1) if stl_mode else 0
+    # Detail no longer follows the sweep. Stepping up to LOD HIGH looked
+    # good and cost too much: 36 ms/frame optical and 49 ms xray at high
+    # detail against 20 and 23 at medium, for a display meant to sit in the
+    # corner of a screen. The wipe stays -- it was the part that was free.
+    lod_i = (lod if stl_mode else 0)
     ao_on = not args.no_ao
     model_name = stl_path if stl_mode else 'MADCAT-X'
 
@@ -2631,6 +2691,12 @@ def main():
             for k in kb.poll():
                 if k in ('q', 'Q'):
                     raise KeyboardInterrupt
+                elif booting and k != 'b':
+                    # Anything at all skips the POST. Nobody wants to sit
+                    # through a boot screen twice, and a sequence you cannot
+                    # interrupt is a sequence you come to resent.
+                    booting = False
+                    continue
                 elif k == ' ':
                     paused = not paused
                     flash, flash_until = ('PAUSED' if paused else 'RUNNING',
@@ -2668,6 +2734,8 @@ def main():
                         flash, flash_until = (
                             'NO TARGET' if sel < 0 else
                             SECTION_NAMES[SECTIONS[sel]].upper(), now + 0.8)
+                elif k == 'b':
+                    booting, boot_t0 = True, now
                 elif k == 'f':
                     chrome = not chrome
                     flash, flash_until = ('CHROME ON' if chrome
@@ -2752,6 +2820,7 @@ def main():
                     DIST, explode_t, wire = args.dist, 0.0, False
                     grid_mode, paused = GRID_SOLID, False
                     sel, scan_seen = -1, None      # target dropped, scan rerun
+                    scan_sweep = 0.0
                     flash, flash_until = 'RESET', now + 0.8
                 elif k == 'ESC':
                     show_help = False
@@ -2855,6 +2924,42 @@ def main():
             if grid_mode == GRID_SOLID:
                 draw_grid(quant(shade(P['grid'], 0.9)))
 
+            # ---- scan state ----
+            # Ahead of the transform, not after it: this block can
+            # swap the level of detail, and `world` below is built
+            # from `parts` -- changing one after the other has been
+            # computed leaves the two indexed against different
+            # meshes.
+            # One bytearray per part, rebuilt whenever the part list changes,
+            # so a level-of-detail switch cannot be scored against the hull it
+            # is no longer drawing.
+            if scan_seen is None or len(scan_seen) != len(parts):
+                scan_seen = [bytearray(len(p.faces)) for p in parts]
+                scan_tot = sum(len(p.faces) for p in parts) or 1
+                scan_left = scan_tot
+                scan_sweep, scan_az = 0.0, az
+            # 'Every facet returned' is the wrong completion test and measuring
+            # it proved as much: it stalls around 96%, because at a fixed tilt
+            # some of the hull -- undersides, the inside of the shoulder --
+            # never turns to face the sensor at any bearing at all. A bar that
+            # asymptotes short of full is the loading-forever bar again.
+            #
+            # A full REVOLUTION is the test that terminates and that means
+            # something: the sensor has now seen the target from every bearing,
+            # and the coverage it reached is the fraction of hull a sweep at
+            # this elevation can return. What it missed is a fact about the
+            # geometry, not an unfinished job -- so the strip stops counting
+            # and reports the achieved figure.
+            scan_sweep += abs(az - scan_az)
+            scan_az = az
+
+            # Active only while the sweep is running, so it is a thing that
+            # happens and then stops rather than an animation that loops
+            # forever -- which is what the old scan bar was.
+            scanning = scan_sweep < 2.0 * math.pi
+            wipey = ((sim % WIPE_PERIOD) / WIPE_PERIOD * pxh) if scanning \
+                else None
+
             # ---- pose and transform ----
             if not stl_mode:
                 pose_mech(frames_d, sim, idle_on)
@@ -2868,12 +2973,24 @@ def main():
                 tx = T[0] + p.expdir[0] * ex
                 ty = T[1] + p.expdir[1] * ex
                 tz = T[2] + p.expdir[2] * ex
-                wv = []
-                for v in p.v:
-                    x, y, z = v
-                    wv.append((M[0] * x + M[1] * y + M[2] * z + tx,
-                               M[3] * x + M[4] * y + M[5] * z + ty,
-                               M[6] * x + M[7] * y + M[8] * z + tz))
+                # Same argument as the normal cache, one stage earlier: the
+                # turntable moves the EYE. On a loaded mesh the root frame is
+                # fixed and nothing explodes, so this transform produced the
+                # same five thousand vertices every frame -- 2 ms of it at high
+                # detail. Keyed on everything that can move a vertex, so an
+                # idle sway or an explode still recomputes and this stays
+                # exact rather than merely usually right.
+                wkey = (M, tx, ty, tz)
+                wv = p.__dict__.get('_wv')
+                if wv is None or p._wv_key != wkey:
+                    wv = []
+                    wa = wv.append
+                    for v in p.v:
+                        x, y, z = v
+                        wa((M[0] * x + M[1] * y + M[2] * z + tx,
+                            M[3] * x + M[4] * y + M[5] * z + ty,
+                            M[6] * x + M[7] * y + M[8] * z + tz))
+                    p._wv, p._wv_key = wv, wkey
                 world.append(wv)
 
             # ---- cast shadow ----
@@ -2927,35 +3044,31 @@ def main():
             SC = P['sel']
             fog0, fog1 = DIST - MRAD * 1.6, DIST + MRAD * 2.4
             fogc = P['sky'][1]
+            sky_c, bounce_c = P['sky'][1], P['bounce']
+            # Everything the shader reads, hoisted out of the loop: attribute
+            # and global lookups are per-facet costs at a few thousand facets.
+            # The shader below is the same expression as ever, with shade() and
+            # lerp() inlined -- including their int() truncations, which is what
+            # makes it bit-for-bit identical to the version that called them
+            # rather than merely close to it.
+            S0, S1, S2 = SUN
+            F0, F1, F2 = FILL
+            b0, b1, b2 = bounce_c
+            ks0, ks1, ks2 = sky_c[0] - b0, sky_c[1] - b1, sky_c[2] - b2
+            fgr, fgg, fgb = fogc
+            fogd = 1.0 / (fog1 - fog0)
+            SCr, SCg, SCb = SC
+            soft = SOFT_MAT
+            rfill, rfill3 = ras.fill, ras.fill3
+            lm = light_mode
             sil = [1e9, 1e9, -1e9, -1e9]        # silhouette box, screen px
             queue = []
-            # One bytearray per part, rebuilt whenever the part list changes,
-            # so a level-of-detail switch cannot be scored against the hull it
-            # is no longer drawing.
-            if scan_seen is None or len(scan_seen) != len(parts):
-                scan_seen = [bytearray(len(p.faces)) for p in parts]
-                scan_tot = sum(len(p.faces) for p in parts) or 1
-                scan_left = scan_tot
-                scan_sweep, scan_az = 0.0, az
-            # 'Every facet returned' is the wrong completion test and measuring
-            # it proved as much: it stalls around 96%, because at a fixed tilt
-            # some of the hull -- undersides, the inside of the shoulder --
-            # never turns to face the sensor at any bearing at all. A bar that
-            # asymptotes short of full is the loading-forever bar again.
-            #
-            # A full REVOLUTION is the test that terminates and that means
-            # something: the sensor has now seen the target from every bearing,
-            # and the coverage it reached is the fraction of hull a sweep at
-            # this elevation can return. What it missed is a fact about the
-            # geometry, not an unfinished job -- so the strip stops counting
-            # and reports the achieved figure.
-            scan_sweep += abs(az - scan_az)
-            scan_az = az
             for pi, p in enumerate(parts):
                 wv = world[pi]
                 M = p.frame.M
                 hot = p is sel_part and not zen
                 praw = p.temp if sensor == SENSOR_THERMAL else None
+                ptemp = p.temp
                 # On a loaded mesh the highlight is per FACET, not per part:
                 # one Part carries the whole shell and the selection is a
                 # section of it.
@@ -2967,8 +3080,16 @@ def main():
                 # at a few thousand vertices the call and its cell lookups cost
                 # more than the arithmetic inside it.
                 fsub = Fl * SUBX
+                # Screen x,y in one list and depth in another, rather than
+                # (x, y, z) triples. The rasteriser and the shader both want
+                # (x, y) pairs, so with triples every facet had to build three
+                # fresh pairs plus a tuple to hold them -- five allocations per
+                # facet where two will do. Split, the pairs are already there
+                # to be referenced.
                 sp = []
+                sz = []
                 spa = sp.append
+                sza = sz.append
                 for w in wv:
                     wx, wy, wz = w
                     wz -= MCZ
@@ -2978,7 +3099,8 @@ def main():
                     if zv < 0.6:
                         zv = 0.6
                     spa((OX + fsub * xr / zv,
-                         OY - Fl * (yr * se + wz * ce) / zv, zv))
+                         OY - Fl * (yr * se + wz * ce) / zv))
+                    sza(zv)
 
                 # World normals depend only on the part's frame matrix -- and
                 # the turntable spins the camera, not the mech, so on a still
@@ -2987,6 +3109,14 @@ def main():
                 # sway, explode, a part selected and pulled out) fails the
                 # comparison and recomputes, so this is exact, not an
                 # approximation.
+                # Vertex indices on their own, cached with the normals. The
+                # gather loop unpacked (idx, mat, ln, lc) per facet and used
+                # one of the four -- mat moved into the lit cache and ln/lc
+                # were never read here -- so three of every four unpacks were
+                # paid for nothing.
+                gidx = p.__dict__.get('_gidx')
+                if gidx is None:
+                    gidx = p._gidx = [f[0] for f in p.faces]
                 nw = p.__dict__.get('_nw')
                 if nw is None or p._nw_M != M:
                     m0, m1, m2, m3, m4, m5, m6, m7, m8 = M
@@ -2996,13 +3126,92 @@ def main():
                           for _i, _m, ln, _c in p.faces]
                     p._nw, p._nw_M = nw, M
 
+                # ---- per-facet lit colour, cached ----
+                # The single biggest cost in this program was the shader, at
+                # 51-53% of the frame, and almost all of what it computed did
+                # not change between frames. The lights are WORLD-fixed and the
+                # turntable moves the EYE, so for a facet that has not moved,
+                # n.SUN, n.FILL, the sheen, the hemisphere ambient and the
+                # weathering are all exactly the numbers they were last frame.
+                # Only fog (range) and the selection tint vary.
+                #
+                # So the lit colour is cached against everything it actually
+                # depends on -- the part's frame matrix, the lighting mode, the
+                # palette, the occlusion toggle and the sensor -- and the
+                # per-frame shader shrinks to fog, tint and fill. Exact, not an
+                # approximation: same expressions, same order, same int()
+                # truncations, evaluated once instead of every frame.
+                if wireonly:
+                    lit = None
+                else:
+                    litkey = (M, lm, pal, ao_on, sensor, id(MAT))
+                    lit = p.__dict__.get('_lit')
+                    if lit is None or p._lit_key != litkey:
+                        lit = []
+                        la = lit.append
+                        for _fi, (_idx, _mat, _ln, _lc) in enumerate(p.faces):
+                            base = MAT[_mat]
+                            n0, n1, n2 = nw[_fi]
+                            wear = wr[_fi]
+                            if sensor == SENSOR_THERMAL:
+                                t_ = ptemp[_fi] if ptemp else 0.0
+                                ti = int(t_ * 64.0)
+                                base = HEAT_LUT[ti if 0 <= ti <= 64 else 0]
+                            if lm == LIGHT_FLAT or sensor == SENSOR_THERMAL:
+                                la(base)
+                                continue
+                            ndl = n0 * S0 + n1 * S1 + n2 * S2
+                            if lm == LIGHT_KEY:
+                                k = (0.34 + 0.78 * ndl) if ndl > 0.0 else 0.34
+                                k *= wear
+                                la((int(base[0] * k), int(base[1] * k),
+                                    int(base[2] * k)))
+                                continue
+                            ndf = n0 * F0 + n1 * F1 + n2 * F2
+                            k = 0.30
+                            if ndl > 0.0:
+                                x2 = ndl * ndl
+                                x4 = x2 * x2
+                                k += 0.72 * ndl + 0.55 * x4 * x4 * ndl
+                            if ndf > 0.0:
+                                k += 0.26 * ndf
+                            k *= wear
+                            r = int(base[0] * k)
+                            g = int(base[1] * k)
+                            b = int(base[2] * k)
+                            if r > 255:
+                                r = 255
+                            elif r < 0:
+                                r = 0
+                            if g > 255:
+                                g = 255
+                            elif g < 0:
+                                g = 0
+                            if b > 255:
+                                b = 255
+                            elif b < 0:
+                                b = 0
+                            t = 0.5 * (n2 + 1.0)
+                            ar = int(b0 + ks0 * t)
+                            ag = int(b1 + ks1 * t)
+                            ab = int(b2 + ks2 * t)
+                            r = int(r + (ar - r) * 0.16)
+                            g = int(g + (ag - g) * 0.16)
+                            b = int(b + (ab - b) * 0.16)
+                            if soft[_mat]:
+                                r = int(r + (base[0] - r) * 0.55)
+                                g = int(g + (base[1] - g) * 0.55)
+                                b = int(b + (base[2] - b) * 0.55)
+                            la((r, g, b))
+                        p._lit, p._lit_key = lit, litkey
+
                 qa = queue.append
                 # Local, and only touched while the scan is incomplete: once
                 # it finishes this whole thing costs one `if scan_left` per
                 # facet, and the gather loop is the hot loop in this program.
                 pseen = scan_seen[pi]
-                for fi, (idx, mat, ln, lc) in enumerate(p.faces):
-                    n = nw[fi]
+                lit_ = lit or gidx          # any same-length list will do
+                for fi, (idx, n, lc_) in enumerate(zip(gidx, nw, lit_)):
                     h = hot if psec is None else (psec[fi] == sel)
                     a = wv[idx[0]]
                     # Backface test against the eye, not against a global
@@ -3023,52 +3232,36 @@ def main():
                     if praw is not None:
                         h = praw[fi]      # thermal carries temperature, not select
                     if len(idx) == 3:
-                        s0 = sp[idx[0]]
-                        s1 = sp[idx[1]]
-                        s2 = sp[idx[2]]
-                        qa(((s0[2] + s1[2] + s2[2]) / 3,
-                            ((s0[0], s0[1]), (s1[0], s1[1]), (s2[0], s2[1])),
-                            mat, n, wr[fi], h))
+                        i0, i1, i2 = idx
+                        qa(((sz[i0] + sz[i1] + sz[i2]) / 3,
+                            (sp[i0], sp[i1], sp[i2]), n, lc_, h))
                         continue
                     zsum = 0.0
                     pts = []
                     for i in idx:
-                        s = sp[i]
-                        pts.append((s[0], s[1]))
-                        zsum += s[2]
+                        pts.append(sp[i])
+                        zsum += sz[i]
                     zsum /= len(idx)
-                    qa((zsum, pts, mat, n, wr[fi], h))
+                    qa((zsum, pts, n, lc_, h))
 
-            queue.sort(key=lambda q: -q[0])
+            queue.sort(key=_getdepth, reverse=True)
             drawn = len(queue)
 
             # ---- shade and fill ----
-            sky_c, bounce_c = P['sky'][1], P['bounce']
-            # Everything the shader reads, hoisted out of the loop: attribute
-            # and global lookups are per-facet costs at a few thousand facets.
-            # The shader below is the same expression as ever, with shade() and
-            # lerp() inlined -- including their int() truncations, which is what
-            # makes it bit-for-bit identical to the version that called them
-            # rather than merely close to it.
-            S0, S1, S2 = SUN
-            F0, F1, F2 = FILL
-            b0, b1, b2 = bounce_c
-            ks0, ks1, ks2 = sky_c[0] - b0, sky_c[1] - b1, sky_c[2] - b2
-            fgr, fgg, fgb = fogc
-            fogd = 1.0 / (fog1 - fog0)
-            SCr, SCg, SCb = SC
-            soft = SOFT_MAT
-            rfill, rfill3 = ras.fill, ras.fill3
-            lm = light_mode
 
             if wireonly:
-                # A return, not a picture: brightness is range, and the only
-                # geometry drawn is the facet outline. Costs no fill at all,
-                # which is why these are the fastest channels in the program.
+                # LIDAR and XRAY were very nearly the same picture: both drew
+                # grazing-angle contours, and XRAY only added the far side at
+                # 62% brightness, which on a mostly convex hull lands inside
+                # the silhouette and reads as noise. Two sensors that produce
+                # the same image are one sensor with two names, so they are
+                # now different instruments answering different questions.
                 near, far = fog0, fog1
                 span = (far - near) or 1.0
                 wc0 = SCAN_COL
-                # View direction, good enough for a grazing test at this range.
+                # View direction, good enough at this range. The SIGN of this
+                # dot is free information the grazing test was throwing away
+                # with abs(): positive is the near side, negative the far.
                 vlen = math.sqrt(camX * camX + camY * camY + camZ * camZ) or 1.0
                 vdx, vdy, vdz = camX / vlen, camY / vlen, camZ / vlen
                 # The silhouette has to be accumulated here as well as in the
@@ -3078,7 +3271,7 @@ def main():
                 # you would be scanning a target with. Over every queued facet,
                 # not just the contours: the box is the target's extent, which
                 # does not depend on which facets happen to graze the view.
-                for zsum, pts, mat, n, wear, hot in queue:
+                for zsum, pts, n, lc_, hot in queue:
                     for px_, py_ in pts:
                         if px_ < sil[0]:
                             sil[0] = px_
@@ -3088,98 +3281,107 @@ def main():
                             sil[1] = py_
                         if py_ > sil[3]:
                             sil[3] = py_
-                    d = n[0] * vdx + n[1] * vdy + n[2] * vdz
-                    if d < 0.0:
-                        d = -d
-                    if d > SCAN_GRAZE:
-                        continue        # facing us: interior, not a contour
-                    g = 1.0 - (zsum - near) / span
-                    if g < 0.12:
-                        g = 0.12
-                    elif g > 1.0:
-                        g = 1.0
-                    if see_through:
-                        g *= 0.62
-                    if hot and psel_on:
-                        c = quant(lerp(shade(wc0, g), SC, 0.5))
-                    else:
-                        c = quant(shade(wc0, g))
-                    for i in range(len(pts)):
-                        a_, b_ = pts[i - 1], pts[i]
-                        ras.line_c(a_[0], a_[1], b_[0], b_[1], c)
+
+                if see_through:
+                    # XRAY: what is BEHIND the near skin. The near side is
+                    # dropped to a faint outline and the far side is drawn
+                    # bright, which is the inversion that makes the channel
+                    # mean something -- you are looking through the front of
+                    # the machine at the inside of its back. The reactor is
+                    # marked because on a real diagnostic x-ray the power
+                    # plant is the one thing you could not miss.
+                    for zsum, pts, n, lc_, hot in queue:
+                        d = n[0] * vdx + n[1] * vdy + n[2] * vdz
+                        if d < 0.0:                   # far side: the payload
+                            # Grazing filter on the far side too. Drawing
+                            # every back-facing outline in full measured at
+                            # 32.5 ms/frame against 22.8 for the old channel,
+                            # and 67 ms at high detail, which is fifteen
+                            # frames a second for an ambient display. The
+                            # inversion is what makes this channel mean
+                            # something, not the density -- so keep the
+                            # inversion and pay for the contours only.
+                            if d < -SCAN_GRAZE:
+                                continue
+                            g = 0.45 + 0.55 * (1.0 - (zsum - near) / span)
+                            if g < 0.2:
+                                g = 0.2
+                            elif g > 1.0:
+                                g = 1.0
+                            c = quant(shade(XRAY_FAR, g))
+                        else:                         # near skin: a ghost
+                            if d > SCAN_GRAZE:
+                                continue
+                            c = quant(shade(wc0, 0.30))
+                        for i in range(len(pts)):
+                            a_, b_ = pts[i - 1], pts[i]
+                            ras.line_c(a_[0], a_[1], b_[0], b_[1], c)
+                    rm = (lods[lod_i].model.report.get('reactor_m')
+                          if (stl_mode and lods) else None)
+                    if rm:
+                        rs = proj(rm[0], rm[1], rm[2])
+                        rx_, ry_ = int(rs[0]), int(rs[1])
+                        # Pulsing, because a fusion plant on an instrument is
+                        # never drawn still.
+                        # Floor the pulse high. At 0.62 the trough quantised
+                        # to (158,143,93), which is olive -- the core spent
+                        # half its cycle reading as a brown stain rather than
+                        # a light source.
+                        pw = 0.86 + 0.14 * math.sin(sim * 3.4)
+                        for dy_ in range(-4, 5):
+                            for dx_ in range(-8, 9):
+                                q = dx_ * dx_ * 0.25 + dy_ * dy_
+                                if q > 16.0:
+                                    continue
+                                # Cut the tail of the falloff off rather than
+                                # letting it run to black: the dim outer ring
+                                # was being drawn ON TOP of the bright interior
+                                # structure and reading as a dark halo, which
+                                # is the opposite of a glow.
+                                gi = pw * (1.0 - q / 24.0)
+                                if gi < 0.58:
+                                    continue
+                                ras.point(rx_ + dx_, ry_ + dy_,
+                                          (255, 255, 240) if q < 1.5
+                                          else quant(shade(XRAY_CORE, gi)))
+                else:
+                    # LIDAR: a range return, so it is drawn as one -- a point
+                    # per vertex of every facet the beam can actually reach,
+                    # brightness by range. No contour filter: a point cloud
+                    # does not scribble the way six thousand outlines did, and
+                    # the density falling off around the curve of the hull is
+                    # the shape of the return rather than an artefact.
+                    rp_ = ras.point
+                    for zsum, pts, n, lc_, hot in queue:
+                        g = 1.0 - (zsum - near) / span
+                        if g < 0.15:
+                            g = 0.15
+                        elif g > 1.0:
+                            g = 1.0
+                        # Facets square to the beam return more energy than
+                        # facets glancing off it, which is true of lidar and
+                        # also happens to shade the cloud.
+                        d = n[0] * vdx + n[1] * vdy + n[2] * vdz
+                        if d < 0.0:
+                            d = -d
+                        c = quant(shade(wc0, g * (0.34 + 0.66 * d)))
+                        sx_ = sy_ = 0.0
+                        for px_, py_ in pts:
+                            rp_(int(px_), int(py_), c)
+                            sx_ += px_
+                            sy_ += py_
+                        # Centroid as well as vertices: vertices are shared
+                        # between neighbouring facets so they land on top of
+                        # each other, and the cloud came out thinner than the
+                        # facet count suggests.
+                        rp_(int(sx_ / len(pts)), int(sy_ / len(pts)), c)
                 queue = []
 
-            for zsum, pts, mat, n, wear, hot in queue:
-                base = MAT[mat]
-                n0, n1, n2 = n
-                if sensor == SENSOR_THERMAL:
-                    # 'hot' carries temperature in this channel, not the
-                    # selection flag. The field is already smooth and already
-                    # normalised, so it goes on the ramp end to end -- the
-                    # earlier version had to squash it into the middle third
-                    # because raw per-facet occlusion swung hard between
-                    # neighbours and read as camouflage. A reactor does not.
-                    ti = int(hot * 64.0)
-                    base = HEAT_LUT[ti if 0 <= ti <= 64 else 0]
-                if lm == LIGHT_FLAT or sensor == SENSOR_THERMAL:
-                    r, g, b = base
-                else:
-                    ndl = n0 * S0 + n1 * S1 + n2 * S2
-                    if lm == LIGHT_KEY:
-                        k = (0.34 + 0.78 * ndl) if ndl > 0.0 else 0.34
-                        k *= wear
-                        r = int(base[0] * k)
-                        g = int(base[1] * k)
-                        b = int(base[2] * k)
-                    else:
-                        ndf = n0 * F0 + n1 * F1 + n2 * F2
-                        k = 0.30
-                        if ndl > 0.0:
-                            # A cheap metallic sheen: the same Lambert term
-                            # raised hard, so a face square to the sun gets a
-                            # hot edge and the rest of the hull stays matte.
-                            # Without it every panel reads as painted card.
-                            # ndl**9 as three squarings, not a pow() call.
-                            x2 = ndl * ndl
-                            x4 = x2 * x2
-                            k += 0.72 * ndl + 0.55 * x4 * x4 * ndl
-                        if ndf > 0.0:
-                            k += 0.26 * ndf
-                        k *= wear
-                        r = int(base[0] * k)
-                        g = int(base[1] * k)
-                        b = int(base[2] * k)
-                    if r > 255:
-                        r = 255
-                    elif r < 0:
-                        r = 0
-                    if g > 255:
-                        g = 255
-                    elif g < 0:
-                        g = 0
-                    if b > 255:
-                        b = 255
-                    elif b < 0:
-                        b = 0
-                if lm == LIGHT_FULL and sensor != SENSOR_THERMAL:
-                    # Hemisphere ambient: an upward face is under the sky and
-                    # takes the sky's colour, a downward face is over the ground
-                    # and takes the ground's. This is what tells a horizontal
-                    # surface from a vertical one on the side the sun never
-                    # reaches, and it is the cheapest single thing that stops
-                    # the model reading as a cut-out. Weak on purpose -- at 0.16
-                    # it tints, it does not wash.
-                    t = 0.5 * (n2 + 1.0)
-                    ar = int(b0 + ks0 * t)
-                    ag = int(b1 + ks1 * t)
-                    ab = int(b2 + ks2 * t)
-                    r = int(r + (ar - r) * 0.16)
-                    g = int(g + (ag - g) * 0.16)
-                    b = int(b + (ab - b) * 0.16)
-                    if soft[mat]:
-                        r = int(r + (base[0] - r) * 0.55)
-                        g = int(g + (base[1] - g) * 0.55)
-                        b = int(b + (base[2] - b) * 0.55)
+            fog_on = lm == LIGHT_FULL and sensor != SENSOR_THERMAL
+            sx0, sy0, sx1, sy1 = sil
+            for zsum, pts, n, lc_, hot in queue:
+                r, g, b = lc_
+                if fog_on:
                     fog = (zsum - fog0) * fogd
                     if fog > 0.0:
                         fog *= 0.30
@@ -3193,21 +3395,57 @@ def main():
                     g = int(g + (SCg - g) * 0.34)
                     b = int(b + (SCb - b) * 0.34)
                 # Gradient only where it can be seen -- see GRAD_MIN_H.
-                ylo = yhi = pts[0][1]
-                for pt in pts:
-                    px_, py = pt
-                    if py < ylo:
-                        ylo = py
-                    elif py > yhi:
-                        yhi = py
-                    if px_ < sil[0]:
-                        sil[0] = px_
-                    elif px_ > sil[2]:
-                        sil[2] = px_
-                if ylo < sil[1]:
-                    sil[1] = ylo
-                if yhi > sil[3]:
-                    sil[3] = yhi
+                # The silhouette box lives in four LOCAL floats for the length
+                # of this loop and is written back once at the end. It was four
+                # list slots, and a list index is a bytecode dispatch plus a
+                # bounds check -- eight of them per facet, in the hottest loop
+                # in the program, to maintain a number nothing reads until the
+                # loop is over.
+                if len(pts) == 3:
+                    (ax_, ay_), (bx_, by_), (cx_, cy_) = pts
+                    ylo = ay_ if ay_ < by_ else by_
+                    if cy_ < ylo:
+                        ylo = cy_
+                    yhi = ay_ if ay_ > by_ else by_
+                    if cy_ > yhi:
+                        yhi = cy_
+                    if ax_ < sx0:
+                        sx0 = ax_
+                    if ax_ > sx1:
+                        sx1 = ax_
+                    if bx_ < sx0:
+                        sx0 = bx_
+                    if bx_ > sx1:
+                        sx1 = bx_
+                    if cx_ < sx0:
+                        sx0 = cx_
+                    if cx_ > sx1:
+                        sx1 = cx_
+                else:
+                    ylo = yhi = pts[0][1]
+                    for pt in pts:
+                        px_, py = pt
+                        if py < ylo:
+                            ylo = py
+                        elif py > yhi:
+                            yhi = py
+                        if px_ < sx0:
+                            sx0 = px_
+                        elif px_ > sx1:
+                            sx1 = px_
+                if ylo < sy0:
+                    sy0 = ylo
+                if yhi > sy1:
+                    sy1 = yhi
+                if wipey is not None:
+                    if ylo > wipey:
+                        r = int(r * WIPE_HELD)
+                        g = int(g * WIPE_HELD)
+                        b = int(b * WIPE_HELD)
+                    elif yhi > wipey - WIPE_BAND:
+                        r = int(r + (SCAN_COL[0] - r) * 0.66)
+                        g = int(g + (SCAN_COL[1] - g) * 0.66)
+                        b = int(b + (SCAN_COL[2] - b) * 0.66)
                 if yhi - ylo >= GRAD_MIN_H:
                     c = (r, g, b)
                     rfill(pts, quant(shade(c, 1.05)), quant(shade(c, 0.93)))
@@ -3222,6 +3460,7 @@ def main():
                     for i in range(len(pts)):
                         a, b_ = pts[i - 1], pts[i]
                         ras.line_c(a[0], a[1], b_[0], b_[1], wc)
+            sil[0], sil[1], sil[2], sil[3] = sx0, sy0, sx1, sy1
 
             # ---- overlay ----
             H, HD, PN = P['hud'], P['hud_dim'], P['panel']
@@ -3460,7 +3699,12 @@ def main():
                 bc1 = min(cols - 2, int(sil[2] / SUBX) + 1)
                 br0 = max(1, int(sil[1] / 2) - 1)
                 br1 = min(rows - 3, int(sil[3] / 2) + 1)
-                locked = (now - t0) > 1.2
+                # Lock follows the SWEEP, not the wall clock. It used to
+                # brighten 1.2 s after the program started, which meant the
+                # brackets said LOCK before the sensor had seen the far side
+                # of the target -- and made the frame at which they changed
+                # depend on how fast the host happened to be running.
+                locked = not scanning
                 BR = H if locked else HD
                 arm = max(2, min(6, (bc1 - bc0) // 4))
                 vrm = max(1, min(3, (br1 - br0) // 4))
@@ -3565,6 +3809,16 @@ def main():
                         otext(vy0, max(vx0 + 1, vx1 - len(crew) - 7), '●',
                               P['alert'], None)
 
+                    # Wipe markers. The chrome's one moving part, and it
+                    # only moves while the sensor is actually acquiring --
+                    # the line between the two carets is the same line the
+                    # renderer is holding geometry back behind.
+                    if wipey is not None:
+                        wr = int(wipey / 2)
+                        if vy0 < wr < vy1:
+                            otext(wr, vx0, '▶', P['sel'], None)
+                            otext(wr, vx1, '◀', P['sel'], None)
+
                     # Bearing tape, on the camera's real azimuth. Gridlines
                     # every 15°, cardinals spelled out, boresight caret fixed
                     # at the centre -- so the tape slides under the caret as
@@ -3603,6 +3857,76 @@ def main():
                                     ctext(r_, lx, '─')
                             e += 10
                         otext(mid, lx - 1, '◀', P['sel'], None)
+
+            # ---- boot sequence ----
+            if booting:
+                if boot_t0 is None:
+                    boot_t0 = now
+                rp_b = (lods[lod_i].model.report
+                        if (stl_mode and lods) else None)
+                if rp_b:
+                    checks = (
+                        ('power bus', 'nominal'),
+                        ('gyro spin-up', '3200 rpm'),
+                        ('sensor head', '%d channels' % len(SENSOR_NAMES)),
+                        ('mesh load', '%s facets' % commas(rp_b['src_tris'])),
+                        ('watertight',
+                         'yes' if rp_b['watertight'] else 'NO'),
+                        ('occupancy grid', '%d³' % rp_b['vox']),
+                        ('solid cells', commas(rp_b['solid_cells'])),
+                        ('limb segmentation',
+                         '%d sections' % len(SECTIONS)),
+                        ('reactor trace',
+                         'located' if rp_b.get('reactor_m') else 'n/a'),
+                        ('armour model', '%.1f t' % CANON['armour_t']),
+                        ('optics calibration', 'nominal'),
+                    )
+                else:
+                    checks = (('power bus', 'nominal'),
+                              ('gyro spin-up', '3200 rpm'),
+                              ('structural model',
+                               '%d parts' % len(parts)),
+                              ('optics calibration', 'nominal'))
+                blen = len(checks) * BOOT_LINE_DT + BOOT_HOLD + BOOT_WIPE
+                bt = now - boot_t0
+                if bt >= blen:
+                    booting = False
+                else:
+                    # The reveal: the panel retreats up the screen over the
+                    # last half second, uncovering a display that has been
+                    # running behind it the whole time.
+                    left = blen - bt
+                    cover = rows if left > BOOT_WIPE else \
+                        int(rows * (left / BOOT_WIPE))
+                    for r in range(cover):
+                        otext(r, 0, ' ' * cols, HD, PN)
+                    bc = max(2, (cols - 46) // 2)
+                    br = max(0, (rows - len(checks) - 6) // 2)
+
+                    def btext(r, c, t, col=None):
+                        if r < cover:
+                            otext(r, c, t[:cols - c], col or HD, PN)
+
+                    btext(br, bc, 'MK-VII TARGETING AND DIAGNOSTIC SUITE',
+                          P['sel'])
+                    btext(br + 1, bc, 'firmware 4.2.7 · cold start')
+                    nshow = int(bt / BOOT_LINE_DT)
+                    for i, (nm, val) in enumerate(checks):
+                        if i >= nshow:
+                            break
+                        r = br + 3 + i
+                        ok = i < nshow - 1 or bt > len(checks) * BOOT_LINE_DT
+                        btext(r, bc, '[%s] %-20s' % ('OK' if ok else '··', nm),
+                              H if ok else HD)
+                        if ok:
+                            btext(r, bc + 26, val)
+                    r = br + 4 + len(checks)
+                    frac = min(1.0, bt / (len(checks) * BOOT_LINE_DT))
+                    btext(r, bc, '%s  %3d%%' % (bar_str(frac, 30),
+                                                int(frac * 100)))
+                    if frac >= 1.0:
+                        btext(r + 2, bc, 'SYSTEMS NOMINAL — ACQUIRING TARGET',
+                              P['sel'])
 
             if show_help:
                 bw = min(cols - 4, 66)
