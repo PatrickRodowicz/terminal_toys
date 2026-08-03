@@ -56,9 +56,12 @@
    python3 mechmodel.py --stats         print the mesh report and exit
    python3 mechmodel.py --lighting key  cheaper shading, still solid-looking
    (also --tilt --az --dist --speed --fps --blocks --zen --lod --voxels
-    --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames)
+    --ao-radius --no-ao --no-cache --no-stars --no-shadow --no-idle --frames
+    --no-chrome --seed)
 
  Live controls (h for the full list):
+   f     cockpit chrome: boresight, viewport frame, and a bearing tape and
+         elevation ladder driven by the camera's real azimuth and tilt.
    m     panel: combat / mesh
    j k   target section -- NO TARGET, torso, arm L/R, leg L/R. The sections
          are segmented off the occupancy grid; see SECTIONS.
@@ -208,7 +211,8 @@ CANON = {
     'podspace':  27.5,                  # tons
     'intro':     2945,
     'origin':    'Clan Wolf',
-    'quirk':     'Weak Head Armor (1)',
+    # No 'quirk': Weak Head Armor is a tabletop rules modifier, not something
+    # true about the machine in the fiction, and the panel is a lore readout.
     # Prime configuration. Counts are Sarna's; locations are not stated there.
     'weapons': (('ER Large Laser', 2), ('ER Medium Laser', 2),
                 ('Medium Pulse Laser', 1), ('LRM-20', 2), ('Machine Gun', 2)),
@@ -926,6 +930,24 @@ SCAN_GRAZE = 0.42        # |n . view| below this is a contour, and only those
 # harder time leaving it.
 REACTOR_R = 0.20         # half-strength distance, as a fraction of mech height
 REACTOR_MIX = 0.76       # weight of the source term against the trapping term
+
+# --- cockpit chrome ---------------------------------------------------------
+# The fixed furniture of a gunsight: boresight, viewport corners, a bearing
+# tape and an elevation ladder. Deliberately NOT decoration -- the tape and the
+# ladder are driven by the camera's real azimuth and tilt, so they are readouts
+# that happen to look like chrome rather than chrome pretending to be readouts.
+# The one invented thing here is the crew: a callsign, a pilot and a hull
+# number, faction-neutral, rolled once at launch. --seed pins them.
+CHROME_SPAN = 120.0       # degrees of bearing visible across the tape
+CHROME_EL = 80.0          # degrees of elevation across the ladder
+CARDINAL = {0: 'N', 45: 'NE', 90: 'E', 135: 'SE',
+            180: 'S', 225: 'SW', 270: 'W', 315: 'NW'}
+UNIT_CALLS = ('ANVIL', 'HAMMER', 'SABRE', 'LANCER', 'VANGUARD', 'TALON',
+              'REAPER', 'WARDEN', 'BASILISK', 'TEMPEST', 'GRENADIER',
+              'MARSHAL', 'PIKEMAN', 'HALBERD')
+PILOT_CALLS = ('SPECTER', 'HAVOC', 'VIPER', 'GHOST', 'JACKAL', 'RAPTOR',
+               'NOMAD', 'FURY', 'CINDER', 'MAGPIE', 'DRIFTER', 'TINDER',
+               'KESTREL', 'BADGER', 'SALVO', 'RIVET')
 
 LIGHT_FULL, LIGHT_KEY, LIGHT_FLAT = 0, 1, 2
 LIGHT_NAMES = ('LIGHTING FULL', 'LIGHTING KEY ONLY', 'LIGHTING FLAT')
@@ -2290,18 +2312,14 @@ HELP = [
     '^ v    tilt               - =    move the cut',
     '[ ]    zoom               j k    target section',
     ', .    spin rate          m      panel: combat/mesh',
-    'd      detail             l      labels',
-    'a      occlusion          L      lighting',
-    'w      wireframe          S      cast shadow',
-    'g      grid               p 1-6  palette',
-    's      starfield          e      exploded view',
-    'i      idle animation     z      zen (hide HUD)',
-    '0      reset              h      this help    q  quit',
-    '',
-    'j k cycle NO TARGET -> torso -> arms -> legs.',
-    'SCAN fills with BEARING swept, not with time; the',
-    'percentage is how much of the hull actually came',
-    'back. A full turn ends it. 0 restarts it.',
+    'd      detail             f      cockpit chrome',
+    'a      occlusion          l      labels',
+    'w      wireframe          L      lighting',
+    'g      grid               S      cast shadow',
+    's      starfield          p 1-6  palette',
+    'i      idle animation     e      exploded view',
+    '0      reset              z      zen (hide HUD)',
+    'h      this help          q      quit',
 ]
 
 
@@ -2337,6 +2355,10 @@ def main():
     ap.add_argument('--no-stars', action='store_true')
     ap.add_argument('--no-shadow', action='store_true')
     ap.add_argument('--no-idle', action='store_true')
+    ap.add_argument('--no-chrome', action='store_true',
+                    help='start with the cockpit chrome off (f toggles it)')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='pin the callsign, pilot and hull number')
     ap.add_argument('--sensor', default='optical',
                     choices=[n.lower() for n in SENSOR_NAMES],
                     help='sensor channel to start in')
@@ -2517,6 +2539,12 @@ def main():
     explode = 0.0
     explode_t = 0.0
     sel = -1              # -1 is NO TARGET, and it is the state you start in
+    chrome = not args.no_chrome
+    crng = random.Random(args.seed)
+    callsign = '%s-%d' % (crng.choice(UNIT_CALLS), crng.randint(1, 6))
+    pilot = crng.choice(PILOT_CALLS)
+    hull = '%04X' % crng.randrange(0x10000)
+    mission_t0 = time.time()
     panel_mode = 0        # 0 combat, 1 mesh
     show_help = False
     # Sensor coverage. Not a decorative barber pole: a byte per facet, set the
@@ -2640,6 +2668,10 @@ def main():
                         flash, flash_until = (
                             'NO TARGET' if sel < 0 else
                             SECTION_NAMES[SECTIONS[sel]].upper(), now + 0.8)
+                elif k == 'f':
+                    chrome = not chrome
+                    flash, flash_until = ('CHROME ON' if chrome
+                                          else 'CHROME OFF', now + 0.8)
                 elif k == 'm':
                     panel_mode = (panel_mode + 1) % 2
                     flash, flash_until = (
@@ -3214,7 +3246,10 @@ def main():
                 # is a line of dead code. Numbers about the renderer belong in
                 # the mesh panel, which is the page about the renderer.
                 if flash and now < flash_until:
-                    otext(1, cols - len(flash) - 3, ' ' + flash + ' ',
+                    # Row 2, not row 1: the chrome's crew line owns the right
+                    # end of row 1 and a flash landing on top of it looked
+                    # like a rendering fault rather than a message.
+                    otext(2, cols - len(flash) - 3, ' ' + flash + ' ',
                           PN, P['alert'])
 
                 if panel > 4 and stl_mode and panel_mode == 0:
@@ -3226,7 +3261,7 @@ def main():
                     # are the ones that mix them -- the armour distribution
                     # below is twelve canon tons spread over measured skin.
                     rp = parts[0].model.report
-                    for r in range(1, rows - 1):
+                    for r in range(1, rows):
                         otext(r, 0, ' ' * panel, H, PN)
                     W = panel - 2
 
@@ -3276,9 +3311,6 @@ def main():
                     lines.append(('dim', CANON['engine'], '', False))
                     lines.append(('kv', 'pod space', '%.1f t'
                                   % CANON['podspace'], False))
-                    lines.append(('blank', '', '', False))
-                    lines.append(('sec', 'QUIRK', '', False))
-                    lines.append(('dim', CANON['quirk'], '', False))
 
                     # Ordered by what a gunner needs first, then simply cut to
                     # fit: a short terminal loses the airframe trivia, not the
@@ -3311,16 +3343,21 @@ def main():
                                   ('▸' if hotl else ' ')
                                   + SECTION_NAMES[SECTIONS[a]][:8],
                                   P['sel'] if hotl else H, PN)
+                            # Right-aligned off the panel edge, not off a
+                            # hand-counted column: '%4.1f t' is six characters
+                            # and panel-5 gave it five, so the unit spilled two
+                            # cells into the model.
+                            val = b + ' t'
                             if panel >= 22:
-                                otext(rr, panel - 12,
+                                otext(rr, panel - 8 - len(val),
                                       bar_str(area[a] / amax, 6), HD, PN)
-                            otext(rr, panel - 5, b + ' t',
+                            otext(rr, panel - 1 - len(val), val,
                                   P['sel'] if hotl else HD, PN)
                         rr += 1
                 elif panel > 4 and stl_mode:
                     # ---- mesh page ----
                     rp = parts[0].model.report
-                    for r in range(1, rows - 1):
+                    for r in range(1, rows):
                         otext(r, 0, ' ' * panel, H, PN)
                     otext(1, 1, os.path.basename(model_name)[:panel - 2],
                           P['sel'], PN)
@@ -3367,7 +3404,7 @@ def main():
                         rr += 1
                 elif panel > 4:
                     mx = max((p.mass for p in parts), default=1.0) or 1.0
-                    for r in range(1, rows - 1):
+                    for r in range(1, rows):
                         otext(r, 0, ' ' * panel, H, PN)
                     otext(1, 1, 'STRUCTURE', P['sel'], PN)
                     otext(2, 1, '─' * (panel - 2), HD, PN)
@@ -3399,13 +3436,6 @@ def main():
                                                      len(p.faces)), HD, PN)
                         otext(rows - 5, 1, '%-*s%5.1f t'
                               % (panel - 8, 'TOTAL', total_mass), H, PN)
-
-                hint = (' <-> orbit  ^v tilt  [] zoom  v sensor  '
-                        + ('jk target  c cutaway  m panel  d detail  '
-                           if stl_mode else 'jk part  e explode  ')
-                        + 'p palette  h help  q quit ')
-                otext(rows - 1, 0, ' ' * cols, HD, PN)
-                otext(rows - 1, 1, hint[:cols - 2], HD, PN)
 
                 if labels:
                     for pi, p in enumerate(parts):
@@ -3447,10 +3477,6 @@ def main():
                     mc = (bc0 + bc1) // 2
                     mr = (br0 + br1) // 2
                     otext(mr, mc - 1, '─┼─', BR)
-                    tag = ' %s %s ' % (CANON['codename'],
-                                       'LOCK' if locked else 'ACQ')
-                    otext(max(0, br0 - 1), mc - len(tag) // 2, tag,
-                          P['sel'] if locked else HD, PN)
 
                 # ---- instrument strip ----
                 # The scan bar was a barber pole -- (sim * 0.7) % 1.0 -- and
@@ -3491,6 +3517,92 @@ def main():
                 otext(0, 0, ' ' * cols, HD, PN)
                 otext(0, 1, strip[:cols - 2], H,
                       PN)
+
+            # ---- cockpit chrome ----
+            # Fixed furniture, drawn over the render with a transparent
+            # background so it reads as glass rather than as a panel. Every
+            # piece of it sits OUTSIDE the model area except the boresight,
+            # which is the one thing a gunsight is allowed to put in the way.
+            if chrome and not zen:
+                # Six columns held back on the right, not four: the ladder
+                # labels are three wide ('+20') and at four they ran off the
+                # last column and vanished entirely.
+                vx0, vx1 = panel + 1, cols - 6
+                vy0, vy1 = 1, rows - 2
+
+                def ctext(r, c, t, col=None):
+                    otext(r, c, t, col or HD, None)
+
+                if vx1 - vx0 > 20 and vy1 - vy0 > 6:
+                    # Viewport corners. Thin and dim on purpose: the lock frame
+                    # is heavy (┏━┃) and moves, this is light (┌─│) and does
+                    # not, so the two never read as the same object.
+                    ctext(vy0, vx0, '┌──')
+                    ctext(vy0, vx1 - 2, '──┐')
+                    ctext(vy1, vx0, '└──')
+                    ctext(vy1, vx1 - 2, '──┘')
+                    for d in (1, 2):
+                        ctext(vy0 + d, vx0, '│')
+                        ctext(vy0 + d, vx1, '│')
+                        ctext(vy1 - d, vx0, '│')
+                        ctext(vy1 - d, vx1, '│')
+
+                    # Crew line. The only invented data on the display, and it
+                    # says so by being the only thing in the dim colour up top.
+                    el_s = int(time.time() - mission_t0)
+                    # Sheds the hull number first on a narrow viewport: a
+                    # full crew line at 90 columns runs straight across the
+                    # top of the lock bracket.
+                    if vx1 - vx0 >= 90:
+                        crew = '%s · %s · HULL %s   T+%02d:%02d' % (
+                            callsign, pilot, hull, el_s // 60, el_s % 60)
+                    else:
+                        crew = '%s · %s   T+%02d:%02d' % (
+                            callsign, pilot, el_s // 60, el_s % 60)
+                    rec = (now % 1.4) < 0.95
+                    ctext(vy0, max(vx0 + 4, vx1 - len(crew) - 4), crew)
+                    if rec:
+                        otext(vy0, max(vx0 + 1, vx1 - len(crew) - 7), '●',
+                              P['alert'], None)
+
+                    # Bearing tape, on the camera's real azimuth. Gridlines
+                    # every 15°, cardinals spelled out, boresight caret fixed
+                    # at the centre -- so the tape slides under the caret as
+                    # the turntable comes round, which is what a tape is.
+                    tw = vx1 - vx0 - 1
+                    brg_c = math.degrees(az) % 360.0
+                    dpc = CHROME_SPAN / tw
+                    tr = vy1 - 1
+                    ctext(tr, vx0 + 1, '·' * tw)
+                    g = int((brg_c - CHROME_SPAN / 2.0) // 15) * 15
+                    while g <= brg_c + CHROME_SPAN / 2.0:
+                        lab = CARDINAL.get(g % 360, '%03d' % (g % 360))
+                        cx_ = vx0 + 1 + int(tw / 2.0 + (g - brg_c) / dpc)
+                        c0_ = cx_ - len(lab) // 2
+                        if vx0 < c0_ and c0_ + len(lab) <= vx1:
+                            ctext(tr, c0_, lab,
+                                  H if len(lab) < 3 else HD)
+                        g += 15
+                    otext(tr, vx0 + 1 + tw // 2, '▲', P['sel'], None)
+
+                    # Elevation ladder, on the camera's real tilt.
+                    lx = vx1 + 2
+                    lh = vy1 - vy0 - 3
+                    if lh > 4 and lx < cols - 1:
+                        el_c = math.degrees(el)
+                        mid = vy0 + 2 + lh // 2
+                        dpr = CHROME_EL / lh
+                        e = int((el_c - CHROME_EL / 2.0) // 10) * 10
+                        while e <= el_c + CHROME_EL / 2.0:
+                            r_ = mid + int((el_c - e) / dpr)
+                            if vy0 + 1 < r_ < vy1:
+                                if e % 20 == 0:
+                                    ctext(r_, lx,
+                                          ' 00' if e == 0 else '%+03d' % e, H)
+                                else:
+                                    ctext(r_, lx, '─')
+                            e += 10
+                        otext(mid, lx - 1, '◀', P['sel'], None)
 
             if show_help:
                 bw = min(cols - 4, 66)

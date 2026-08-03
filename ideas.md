@@ -797,6 +797,36 @@ that was worth keeping went into the docstring and into comments beside the
 things they describe; the rest was explaining decisions to someone who had not
 asked.
 
+#### Cockpit chrome
+
+`mech.sh` and `mech2.sh` are the reference for atmosphere here — a scene player
+with radio chatter, and a live dashboard with a sweep radar, gauge stack,
+waveform and event ticker. Both have something this program did not: *things
+happening*. This program has something neither can have: the mech is actually
+there. So the chrome is built to be driven by the model rather than to sit
+beside it.
+
+The bearing tape and the elevation ladder are readouts wearing chrome's
+clothes: the tape slides under a fixed caret on the camera's real azimuth, the
+ladder tracks its real tilt. The viewport corners are deliberately *thin*
+(`┌─│`) against the lock frame's heavy (`┏━┃`), because one is fixed and one
+moves and they must never read as the same object. The boresight is a broken
+cross so the centre of the sight is a gap you can see through.
+
+The only invented data is the crew — callsign, pilot, hull number — rolled once
+at launch from `--seed`, faction-neutral by request. It sheds the hull number
+first on a narrow viewport, because at 90 columns the full line ran across the
+top of the lock bracket.
+
+Two things measured rather than assumed: the ladder labels are three wide
+(`+20`) and the first version reserved four columns on the right, so they ran
+off the last column and vanished entirely; and the armour tonnage in the combat
+panel is `'%4.1f t'`, six characters, written at `panel - 5` — it spilled two
+cells into the model. Both are now right-aligned off the panel edge rather than
+a hand-counted column, which is the fix that stays fixed.
+
+All of it is behind `f`, and `--no-chrome` starts without it.
+
 Open: the torso is one 60% lump by request — CT/LT/RT is a later job. HD will not
 come from topology at all, since the Mad Cat's cockpit is a canopy faired into the
 torso and never becomes its own component; it needs a geometric rule and should be
