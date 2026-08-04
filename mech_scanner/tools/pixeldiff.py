@@ -17,12 +17,20 @@ Note what a static pose can hide. If the pose does not move, a cache with an
 incomplete key still returns the right answer, because the thing its key forgot
 never changed. So the turntable is left spinning for the comparison.
 
-Both builds are pointed at this project's mech directory and its cache, so the
-comparison is between two renderers and not between two copies of a mesh.
+Both builds are pointed at this project's mech directory, so the comparison is
+between two renderers and not between two copies of a mesh. They get SEPARATE
+cache directories, though. Sharing one looks tempting and is a trap: the cache
+filename does not carry CACHE_VER, only the file header does, so across a
+version bump the two builds each reject and overwrite the other's file, every
+run rebuilds cold, and the progress output shifts the frame stream. That
+produced a full column of control failures once -- during, of course, the one
+comparison that mattered, since a cache version bump is exactly when you want
+this tool.
 
 Usage:  python3 tools/pixeldiff.py OLD_PROJECT_DIR [NEW_PROJECT_DIR]
         where each directory contains a scan.py entry point.
 """
+import hashlib
 import os
 import subprocess
 import sys
@@ -48,6 +56,13 @@ FRAMES = 55
 MECH = os.path.join(PROJ, 'mechs', 'timber_wolf')
 
 
+def cache_of(proj):
+    """One cache directory per build, under this project's cache. See above."""
+    return os.path.join(PROJ, 'cache', 'diff-%s'
+                        % hashlib.sha1(proj.encode('utf-8', 'replace'))
+                        .hexdigest()[:10])
+
+
 def run(proj, args, cols, rows):
     env = dict(os.environ, COLUMNS=str(cols), LINES=str(rows))
     cmd = [sys.executable, os.path.join(proj, 'scan.py')]
@@ -55,7 +70,7 @@ def run(proj, args, cols, rows):
         cmd.append(MECH)
     cmd += ['--frames', str(FRAMES), '--fps', '999', '--seed', '7',
             '--no-boot', '--no-chrome', '--cache-dir',
-            os.path.join(PROJ, 'cache'), '--dt', repr(1.0 / 30.0)] + args
+            cache_of(proj), '--dt', repr(1.0 / 30.0)] + args
     r = subprocess.run(cmd, cwd=proj, env=env, capture_output=True)
     return r.stdout.decode('utf-8', 'replace')
 

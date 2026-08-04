@@ -1140,6 +1140,166 @@ called mech_scanner containing a `mechmodel.py` was one legacy too many. That
 rename collided with the package's own `scan.py` (the sensor sweep), which is
 now `sweep.py` — a better name for it regardless.
 
+#### The second machine, and what it proved about the first
+
+Adding a Marauder MAD-3R was the first real test of "adding a mech is adding a
+directory", and the canon side passed without touching a line of code: drop the
+STL in `mechs/marauder/`, write a `canon.md` off Sarna, `python3 scan.py
+marauder`. Rule 2 did its job unprompted — the Marauder is not an OmniMech so
+there is no pod space, and Sarna gives its speeds in km/h but never its walk and
+run MP, so both blocks are simply absent and the panel is shorter. Converting
+43.2 km/h to 4 MP is a rules calculation, not a quotation, and the whole point
+of the rule is that the file may not do it.
+
+The geometry side did not pass, and the failure was worth having. The
+segmentation's acceptance test was **two outboard components on each side of
+the mirror plane** — bilateral evidence, and correct evidence, but written while
+looking at exactly one machine. A Timber Wolf has two arms and two legs. A
+Marauder's arms are gauntlets slung under wide shoulders, and no erosion depth
+parts them from the trunk. At depth 5 the sweep found a clean core plus one lobe
+on each side at 0.28 of the height — its two legs, perfectly — and *threw the
+result away*, fell through to the one-lump fallback, and reported the entire
+machine as torso with all 11.5 tons of armour on it.
+
+The fix is that two per side is the *preferred* answer and one per side is an
+*accepted* one: the sweep keeps the deepest symmetric-but-thin result as it goes
+and uses it only if nothing better turns up. Bilateral agreement is still the
+evidence — a lone lobe on one side and nothing on the other is refused as noise.
+The Marauder now gives a core and two legs at 27.8 and 28.3 m³, agreeing to
+1.8%, which is the same free symmetry check the Timber Wolf's legs give.
+
+Two smaller things fell out of it:
+
+- **A section that does not exist must be absent, not zero.** The panel, the
+  report and the `j`/`k` target cycle all take their list from
+  `segment.present()` now. Listing `arm L 0.0 t` on a machine whose arms never
+  parted reads as a limb that has been shot off, which is a worse lie than
+  saying nothing.
+- **With one lobe on a side, height decides leg from arm.** With two, the lower
+  is a leg by construction; with one there is nothing to be lower than, so it is
+  a leg only if it hangs below the trunk's own centroid. A machine could have
+  outboard shoulder pods and no separable legs, and calling those legs because
+  they were the only thing there would be the same error one level down.
+
+The generalising lesson: **an acceptance test written against one specimen
+encodes that specimen.** `len(left) >= 2 and len(right) >= 2` was not a bug in
+its own terms — it is exactly the right test for a mech with four limbs, and it
+came with a comment explaining why symmetry made it evidence rather than
+assumption. What it lacked was any way to succeed *partially*. All-or-nothing
+acceptance turns a correct partial answer into the worst available answer, and
+the fallback branch is where that damage lands.
+
+`pixeldiff.py` earned another entry in its own troubleshooting section on the
+way through: the run that had to prove the Timber Wolf unchanged came back 18
+control failures out of 20. `cache_path()` does not put `CACHE_VER` in the
+filename, only in the file header, so with the version bumped the old and new
+builds each rejected and overwrote the other's cache file, every run rebuilt
+cold, and the load progress shifted the frame stream. The two builds get
+separate cache directories now. A cache version bump is precisely when this tool
+is wanted, and it was precisely the case that broke it. With that fixed: 20
+comparisons, 0 differing, 0 control failures.
+
+Three more machines went in behind the Marauder — an Atlas AS7-D, a Catapult
+CPLT-C1 and an Archer — and five meshes is enough to see what the segmentation
+actually does. The Archer and the Atlas give all five sections with the limbs
+matching side to side within 2%. The Marauder gives three. The Catapult gives
+three, and interestingly not the three you would guess: its ear pods part from
+the trunk at erosion depth 8 and its legs only at depth 5, and since the sweep
+commits to one depth it scores the ears and never sees the legs. The new
+height test then labelled the ears **arms** rather than legs, which is right
+twice over — they sit above the trunk's centroid, and the CPLT-C1 really does
+mount its LRM-15s in its arms.
+
+That is the next honest limitation: one depth cannot see a machine whose joints
+are of different thicknesses. Merging seeds across depths would fix it and is a
+different algorithm. What the current one gets right is that it never reports a
+limb it did not measure.
+
+The other thing four canon files taught, which one never could: **a canon.md
+can spill the panel, because the panel cannot know how long a field is.**
+`_field` right-aligned its value to the panel edge and clipped only when the
+value collided with the key, so 'Earthwerks Incorporated' ran three cells past
+the panel and into the mech. Every value on that page now comes from a file
+outside the program, so its length is not something the layout can know in
+advance and clipping is the only defence. The temptation was to shorten the
+field in the canon.md instead — which is letting the layout dictate the data,
+exactly backwards.
+
+#### Changing target without leaving the sight
+
+Five mechs in `mechs/` and the only way to look at a different one was to quit
+and relaunch, which is a poor answer for a program whose whole point is that
+you leave it running in a corner. `n` and `N` now step through the directory in
+place.
+
+The interesting part is not the key, it is that **a build cannot happen on the
+frame loop**. Cold, the Atlas takes 6.8 seconds of decimation, voxelisation,
+occlusion and segmentation, and a sight that freezes for seven seconds has
+failed at the one thing it does. So the build runs on a worker thread while the
+display keeps turning the machine you are still looking at. Measured: 25.4 fps
+against a 30 fps cap during the build. The worker and the frame loop share one
+interpreter, so it is a visible tax — but a tax, not a freeze, and degrading
+while it works is honest in a way a spinner is not.
+
+Four rules made it safe, and each is a bug that did not happen:
+
+- **The worker touches nothing but its own object.** In particular it does not
+  write to stdout: the emitter holds the writer's lock for most of every frame,
+  so a second writer lands in the middle of one. The pipeline's `note` callback
+  appends to a list instead — which is also where the readout comes from.
+- **The swap happens in the frame loop, at the top of a frame.** `rig` is a
+  local bound once outside the loop, so half a frame against the old mesh and
+  half against the new is one missed rebinding away. Same hazard `Scan.bind`
+  was already written to guard against.
+- **`scan.restart()` on the swap is not optional.** Both rigs have exactly one
+  part in stl_mode, so `bind()` finds the part count unchanged, keeps the old
+  `seen` arrays and scores the new mesh against the old hull's facet indices.
+  The docstring on `bind` warns about precisely this for level-of-detail
+  switches; a mech swap is the same thing with a bigger difference.
+- **The thread is a daemon,** so a signal teardown does not wait seven seconds
+  for a decimation before restoring the terminal. Verified: six teardowns
+  landed mid-build across all three signals, zero failures.
+
+Restarting the scan turned out to be free flavour as well as correctness. The
+acquisition wipe runs down the new hull and the lock brackets stay dim until
+the sensor has swept it — which is not decoration, because it genuinely has not
+been seen yet.
+
+**The readout is the pipeline's own progress messages.** `reading as7-d4.stl`,
+`analysing 84,468 facets`, `voxelising at 80^3`, `mirror plane 62% symmetric`,
+`decimating 84,468 facets to 14,000`. Nothing on it is written for the
+occasion, which is the whole reason it is worth watching — the same principle
+as the cold-start POST reporting this run's real numbers. A warm cache says
+`3 levels from cache` rather than miming work it did not do; that needed a new
+note in `load_models`, because a cache hit used to say nothing at all and a
+readout with no lines on it looks like a hang.
+
+And **no progress bar**, which is the one design decision here worth arguing
+about. The number of stages is not known before they happen, so a bar would be
+guessing at its own denominator — and this project has already learned what
+that costs, when the scan bar asymptoted at 96% because some of the hull never
+faces the sensor at any bearing. Elapsed seconds instead: the one number
+actually known, frozen when the build stops, so what is left on screen is what
+the acquisition cost. `MIN_HOLD` does keep the box up for 1.15 s even on a warm
+cache, which is padding — but padding the *duration* of a true readout is a
+different thing from inventing its content.
+
+Two small ones, both found by driving a real pty rather than by reading:
+
+- The box title was composed as a frame string plus an overlapping title
+  string, and left a stray letter poking out of the rule: `┌TARGET ACQUISITION
+  N ────`. Fixed by composing one string of exactly the right width and
+  recolouring a slice of it in place. Two overlapping writes to the same cells
+  are never worth the cleverness.
+- The `LOCK · ARCHER` flash went up with the panels and the cockpit chrome was
+  drawn *after* it, straight through the middle: `LOCK · AR│HER`. The flash now
+  draws on top of the chrome. An alert the decoration can cut in half is not an
+  alert — and this had never shown up before only because every existing flash
+  was short enough to miss the frame.
+
+Timber Wolf still 20/20 byte-identical through all of it, which is the point of
+keeping that harness pointed at a fixed mech.
+
 ## Not built yet
 
 ### 1. Falling-code rain, fed from something real

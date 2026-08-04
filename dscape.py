@@ -27,8 +27,9 @@
    python3 dscape.py --footprint count  ground plan by file count, not bytes
    python3 dscape.py --blocks half      coarser glyphs if quadrants look wrong
    python3 dscape.py --speed 2.5        orbit rate (also live, with , and .)
+   python3 dscape.py --fps 60           frame cap, 30 by default (live, with F)
    python3 dscape.py --print            no graphics, just a du-style report
-   (also --fps --tilt --zen --no-windows --no-stars)
+   (also --tilt --zen --no-windows --no-stars)
 
  Live controls (press h in-flight for the full list):
    SPACE pause orbit    q quit          h help
@@ -1116,6 +1117,7 @@ HELP_LINES = [
     'BKSP   ascend (rescans',
     '       above the root)',
     'r      rescan subtree',
+    'F      frame cap',
     'x      mark path',
     'b      biggest files',
     'l      district labels',
@@ -1150,6 +1152,7 @@ WALK_HELP_LINES = [
     'j / k  select district',
     '       (the beam)',
     'r      rescan subtree',
+    'F      frame cap',
     'b      biggest files',
     'l      district labels',
     'g      grid: solid / x-ray / off',
@@ -1290,6 +1293,12 @@ def main():
     prev_now = t0
     frame = 0
     fps_avg = args.fps
+    # The cap is live, so --fps only seeds it. Its own value goes into the ring
+    # wherever it sorts, so F always starts from what you asked for rather than
+    # jumping to the nearest preset. 0 is the uncapped rung.
+    fps_ring = sorted({15.0, 30.0, 60.0, 120.0, float(args.fps)} - {0.0})
+    fps_ring.append(0.0)
+    fps_limit = float(args.fps)
 
     pending_select = None   # name to re-select once a fresh scan surfaces it
     sel_node = None         # the selection is a *node*, not a row index
@@ -1758,6 +1767,13 @@ def main():
                 elif k == 'r':
                     start_scan(cur.path())
                     flash, flash_until = 'RESCAN', now + 1.0
+                elif k == 'F':
+                    # r is the rescan, so the frame cap takes the shifted key.
+                    i = (fps_ring.index(fps_limit) + 1) % len(fps_ring)
+                    fps_limit = fps_ring[i]
+                    flash = ('FPS UNCAPPED' if fps_limit <= 0
+                             else f'FPS LIMIT {fps_limit:g}')
+                    flash_until = now + 0.9
                 elif k in ('h', '?'):
                     show_help = not show_help
                 elif k == '0':
@@ -2605,7 +2621,9 @@ def main():
                     keys = 'j/k select  ENTER descend  BKSP up  h help  q quit'
                 if cols - panel - len(stat_l) - 8 > len(keys):
                     otext(rows - 1, cols - len(keys) - 1, keys, HD)
-                fpsl = f' {fps_avg:4.1f}fps  {len(blds)} blocks  {footprint} '
+                cap = '' if fps_limit <= 0 else f'/{fps_limit:g}'
+                fpsl = (f' {fps_avg:4.1f}{cap}fps  {len(blds)} blocks  '
+                        f'{footprint} ')
                 otext(0, cols - len(fpsl), fpsl, HD, bar_bg)
                 if marked:
                     m = f' {len(marked)} MARKED '
@@ -2779,8 +2797,12 @@ def main():
 
             frame += 1
             dt = time.time() - now
-            fps_avg += (1.0 / max(dt, 1e-3) - fps_avg) * 0.1
-            time.sleep(max(0.0, 1.0 / args.fps - dt))
+            # dt_frame spans frame start to frame start, so it includes the cap
+            # sleep; dt is only the work. Averaging 1/dt reported the rate the
+            # renderer *could* sustain, which read as 298fps under a 30fps cap.
+            fps_avg += (1.0 / max(dt_frame, 1e-3) - fps_avg) * 0.1
+            if fps_limit > 0:
+                time.sleep(max(0.0, 1.0 / fps_limit - dt))
     except (KeyboardInterrupt, BrokenPipeError):
         pass
     finally:

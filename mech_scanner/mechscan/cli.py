@@ -12,9 +12,8 @@ import sys
 
 from . import __doc__ as _pkg_doc
 from . import canon as canon_mod
-from .app import App
+from .app import App, build_rig
 from .lighting import LIGHT_ARGS
-from .mesh.model import LOD_TARGETS
 from .mesh.report import print_mesh_report
 from .palettes import PAL_NAMES
 from .render.sensors import SENSOR_NAMES
@@ -171,12 +170,7 @@ def main(argv=None):
             sys.stdout.flush()
 
         try:
-            rig = Rig.from_stl(
-                mech.stl, targets=(args.faces,) if args.faces else LOD_TARGETS,
-                up=args.up or mech.up, ao_radius=args.ao_radius,
-                vox=args.voxels, no_ao=args.no_ao, note=note,
-                use_cache=not args.no_cache, lod=args.lod, canon=mech.canon,
-                cache_dir=args.cache_dir)
+            rig = build_rig(mech, args, note=note)
         except (OSError, ValueError, struct.error) as e:
             print('cannot load %s: %s' % (mech.stl, e), file=sys.stderr)
             return 2
@@ -190,7 +184,7 @@ def main(argv=None):
             print_structure(rig)
         return 0
 
-    app = App(rig, args)
+    app = App(rig, args, mech)
     app.install_signals()
     app.run()
     return 0

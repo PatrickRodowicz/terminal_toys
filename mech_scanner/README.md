@@ -29,6 +29,7 @@ Each machine is a directory under [`mechs/`](#mechs) holding its mesh and a
 - [What it does](#what-it-does)
 - [Mechs](#mechs)
 - [Controls](#controls)
+- [Changing target](#changing-target)
 - [Command line](#command-line)
 - [How it is put together](#how-it-is-put-together)
 - [The mesh pipeline](#the-mesh-pipeline)
@@ -69,8 +70,8 @@ mesh and each answered from something already measured.
 | XRAY | The inversion: the near skin drops to a ghost and the far side of the hull is drawn bright, with the reactor marked and pulsing. |
 
 **Two panel pages** (`m`). COMBAT is what a gunner would want — designation,
-tonnage, loadout, heat sinks, speeds, and the armour spread over the machine's
-five sections. MESH is the renderer's own report — welded vertex count, whether
+tonnage, loadout, heat sinks, speeds, and the armour spread over the sections
+the segmentation found. MESH is the renderer's own report — welded vertex count, whether
 every edge is used exactly twice, decimation error against the source, facets
 drawn, frame rate.
 
@@ -99,10 +100,14 @@ Each machine is a directory under `mechs/`:
 
 ```
 mechs/
-├── timber_wolf/
+├── timber_wolf/          TIMBER WOLF (MAD CAT) PRIME
 │   ├── timber_wolf.stl   the geometry
 │   ├── canon.md          the facts, with their sources
 │   └── reference.png     optional, never read by the program
+├── marauder/             MARAUDER MAD-3R
+├── atlas/                ATLAS AS7-D
+├── catapult/             CATAPULT CPLT-C1
+├── archer/               ARCHER ARC-2R
 └── _template/
     └── canon.md          the format, documented — a leading _ is skipped
 ```
@@ -198,12 +203,17 @@ There is **no mass** on the survey, because mass is not a property of a mesh:
 turning a volume into a tonnage needs a density, and picking a density to reach
 a tonnage you already believe is circular.
 
-The five sections also change their names, because they change their meaning.
-What the segmentation finds is the largest eroded core plus up to two outboard
+The sections also change their names, because they change their meaning. What
+the segmentation finds is the largest eroded core plus up to two outboard
 components on each side of the measured mirror plane, split by height. On the
 Timber Wolf those *are* a torso, two arms and two legs, and saying so reports a
 fact. On anything else, calling one `arm L` invents an anatomy the geometry
 never claimed — so they become `core`, `upper L/R` and `lower L/R`.
+
+There may be fewer than five. The Marauder yields three — a core and two legs,
+its arms never parting from the trunk — and the ones it does not yield are
+absent from the panel, the report and the target cycle rather than listed at
+0.0 t, which would read as a limb that had been shot off.
 
 The two columns above are worth a second look. On the reference mesh the core
 is 63.0% of the displacement but only 59.3% of the surface, which is exactly
@@ -227,7 +237,8 @@ s      starfield          L      lighting
 i      idle animation     p 1-6  palette
 e      exploded view      z      zen (hide HUD)
 r      frame rate cap     0      reset
-h      this help          q      quit
+n N    next / prev mech   h      this help
+                          q      quit
 ```
 
 `r` steps the cap through 10 / 15 / 24 / 30 / 60 / 120 / uncapped. This is an
@@ -236,14 +247,67 @@ control and not a formality — at 200×60 the renderer will happily eat a core
 drawing frames nobody is looking at. Default 60; `--fps` sets it at launch and
 `--fps 0` starts uncapped.
 
-`j`/`k` cycle NO TARGET → torso → arm L → arm R → leg L → leg R. **NO TARGET is
-a real state, not a sentinel to skip past**: a gunner who wants the whole
-machine with nothing highlighted has to be able to get there.
+`n` and `N` step through `mechs/` **without leaving the sight** — see
+[Changing target](#changing-target) below.
+
+`j`/`k` cycle NO TARGET → torso → arm L → arm R → leg L → leg R, skipping any
+section this machine does not have — the Marauder has no separable arms, so it
+cycles NO TARGET → torso → leg L → leg R. **NO TARGET is a real state, not a
+sentinel to skip past**: a gunner who wants the whole machine with nothing
+highlighted has to be able to get there.
 
 `e` and `i` are **silently inert** on a loaded mesh, which is one rigid
 watertight shell with no joints to move. A key that is deliberately inert
 should say nothing at all — an explanatory flash every time you press it is
 worse than no response.
+
+---
+
+## Changing target
+
+`n` and `N` step through `mechs/` in place. There is no restart and no pause:
+the build runs on a worker thread while the sight keeps drawing the machine you
+are still looking at.
+
+```
+┌ TARGET ACQUISITION ───────────────── 3.1 s ┐
+│ ATLAS                                      │
+│ [OK] reading as7-d4.stl                    │
+│ [OK] analysing 84,468 facets               │
+│ [OK] voxelising at 80^3                    │
+│ [OK] segmenting limbs                      │
+│ [OK] mirror plane 62% symmetric            │
+│ [··] decimating 84,468 facets to 14,000    │
+└────────────────────────────────────────────┘
+```
+
+Those lines are the mesh pipeline's own progress messages, arriving as the
+stages finish. **Nothing on the readout is invented**: every line is work that
+actually ran, and a warm cache says `3 levels from cache` rather than miming
+four seconds it did not spend.
+
+There is deliberately **no progress bar**. The number of stages is not known
+before they happen, so a bar would be guessing at its own denominator — and
+this program has already learned once what a bar that cannot honestly reach
+100% does to a display (see the scan, above). Elapsed seconds is the readout
+instead, because it is the one number that is actually known. It stops when the
+build stops, so what is left on screen is what the acquisition cost.
+
+Measured on a cold cache: the Atlas takes **6.8 s** to build, during which the
+sight kept drawing at **25.4 fps against a 30 fps cap**. The worker and the
+frame loop share one interpreter, so a build is a visible tax on the frame rate
+— but it is a tax, not a freeze, and a warm cache costs 0.2 s.
+
+The swap itself happens in the frame loop, at the top of a frame, before
+anything has read the rig. Half a frame drawn against the old mesh and half
+against the new is the same class of bug `Scan.bind` already guards against.
+On the swap the target selection drops to NO TARGET and **the sweep starts
+over**, so the acquisition wipe runs down the new hull and the lock brackets
+stay dim until the sensor has actually seen it. That is not decoration: it has
+not been seen yet.
+
+A build that fails does not take the sight with it. The box turns red, keeps
+the reason on screen for three seconds, and leaves you on the machine you had.
 
 ---
 
@@ -305,6 +369,7 @@ mechscan/
 ├── canon.py        reading a mech directory and its canon.md
 ├── lighting.py     the world-fixed light rig; the three lighting modes
 ├── sweep.py        the sensor sweep: what the instrument has actually seen
+├── acquire.py      changing target while the sight runs: the worker thread
 ├── rig.py          what is being drawn, and the measurements taken off it at load
 ├── app.py          state, input, and the frame loop
 ├── cli.py          argument parsing, model selection, --stats
@@ -314,7 +379,7 @@ mechscan/
 │   ├── decimate.py     vertex clustering to a facet budget
 │   ├── voxels.py       the occupancy grid: burn, flood the outside, cross-check
 │   ├── occlusion.py    a hemisphere of rays per facet, marched against the grid
-│   ├── segment.py      erosion + connected components + watershed → five limbs
+│   ├── segment.py      erosion + connected components + watershed → the limbs
 │   ├── thermal.py      the reactor heat field
 │   ├── shadow.py       ground shadow as height bands, precomputed at load
 │   ├── model.py        the Model, and the normalise that stands it on the ground
@@ -338,6 +403,7 @@ mechscan/
     ├── reticle.py      lock brackets and the instrument strip
     ├── chrome.py       cockpit furniture and the crew
     ├── boot.py         the cold start
+    ├── acquire.py      the target acquisition readout
     └── help.py         the key list
 ```
 
@@ -475,9 +541,10 @@ therefore valid whether or not you claim to know what it depicts.
 `render/` or `hud/`.
 
 ```
-input → camera → sky → ground and grid → scan state → pose and transform
-      → cast shadow → gather faces → shade and fill → overlay
-      → targeting frame → cockpit chrome → boot sequence → paint
+input → acquire → camera → sky → ground and grid → scan state
+      → pose and transform → cast shadow → gather faces → shade and fill
+      → overlay → targeting frame → cockpit chrome → flash
+      → acquisition readout → boot sequence → paint
 ```
 
 The `# ---- name ----` comments marking those stages are **load-bearing**:
@@ -491,6 +558,12 @@ Two ordering constraints were bugs first:
   been computed leaves the two indexed against different meshes.
 - **`drawn` is taken before the instrument channels consume the queue**, so the
   mesh panel reports the same facet count in every channel.
+- **A target swap happens in `acquire`, at the top of the frame**, before
+  anything has read `rig` — same reason as the first.
+- **The flash is drawn after the chrome.** It used to go up with the panels,
+  and the viewport frame was then drawn straight through `LOCK · ARCHER`,
+  cutting the message in half. An alert the decoration can carve up is not an
+  alert.
 
 **Painter's algorithm over individual facets**, sorted by mean camera-space
 depth. The sibling program `dscape.py` can do better than a sort, because its
@@ -645,9 +718,18 @@ never happen.
   invention, and by this project's own sourcing rule it should stop borrowing
   the name. Its tonnage comes from a calibrated density model rather than from
   any source, which is the one place a density is still asked to produce a mass.
-- **Segmentation always finds five sections**, even on a mesh with no limbs.
-  The counts are honest — they partition the solid exactly — but a sphere will
-  still be reported as a core and four lobes.
+- **Segmentation finds between one and five sections**, and cannot find a limb
+  that never parts from the trunk. The Marauder's arms are gauntlets slung
+  under wide shoulders and no erosion depth separates them, so its readout is a
+  torso and two legs and its arms are counted as torso. That is honest — the
+  counts still partition the solid exactly — but it is not the same as the
+  machine not having arms.
+- **The segmentation commits to a single erosion depth**, and on some meshes no
+  single depth sees everything. The Catapult's ear pods part at depth 8 and its
+  legs at depth 5, and it is scored at 8, so it reports a torso and two arms and
+  its legs go unfound. Merging seeds across depths would fix it and is a
+  different algorithm; the present one at least never reports a limb it did not
+  measure.
 - **The emitter is unoptimised**, at 15–25% of the frame. See above.
 
 ---
@@ -660,6 +742,7 @@ mech_scanner/
 ├── scan.py              launcher; python3 -m mechscan is equivalent
 ├── mechs/               one directory per machine
 │   ├── timber_wolf/         mesh + canon.md + reference image
+│   ├── marauder/ atlas/ catapult/ archer/
 │   └── _template/           the canon.md format, documented
 ├── mechscan/            the package
 ├── tools/               measurement harnesses

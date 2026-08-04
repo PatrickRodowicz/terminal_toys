@@ -65,22 +65,26 @@ def print_mesh_report(src, lods, canon=None, mech=None):
     print('SECTIONS   segmented off the occupancy grid by erosion + watershed')
     names = section_names(canon)
     share = src.get('sec_share') or []
+    # Only the sections that exist: see segment.present. A machine whose arms
+    # never part from its trunk should not be reported as having two arms of
+    # nothing.
+    pres = src.get('sec_present')
+    if pres is None:
+        pres = list(range(len(share)))
     if canon:
         print('  %-8s %10s %10s' % ('section', 'volume m3', 'mass t'))
-        for i, sec in enumerate(SECTIONS):
-            if i < len(share):
-                print('  %-8s %10.1f %10.1f'
-                      % (names[sec], share[i] * src['built_volume'],
-                         share[i] * float(canon['mass_t'])))
+        for i in pres:
+            print('  %-8s %10.1f %10.1f'
+                  % (names[SECTIONS[i]], share[i] * src['built_volume'],
+                     share[i] * float(canon['mass_t'])))
     else:
         area = src.get('sec_area') or []
         print('  %-8s %10s %9s %9s' % ('section', 'volume m3', 'of vol', 'of skin'))
-        for i, sec in enumerate(SECTIONS):
-            if i < len(share):
-                print('  %-8s %10.1f %8.1f%% %8.1f%%'
-                      % (names[sec], share[i] * src['built_volume'],
-                         share[i] * 100.0,
-                         (area[i] * 100.0) if i < len(area) else 0.0))
+        for i in pres:
+            print('  %-8s %10.1f %8.1f%% %8.1f%%'
+                  % (names[SECTIONS[i]], share[i] * src['built_volume'],
+                     share[i] * 100.0,
+                     (area[i] * 100.0) if i < len(area) else 0.0))
     print()
     print('%-8s %8s %8s %6s %10s %10s' %
           ('LEVEL', 'FACETS', 'VERTS', 'GRID', 'VOL ERR', 'AREA ERR'))

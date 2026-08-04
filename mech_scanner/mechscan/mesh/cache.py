@@ -30,7 +30,7 @@ CACHE_MAGIC = b'MMSH'
 # 9: the report no longer carries built_mass / built_density, which were canon
 # and not measurement. Bumping this invalidates every v8 file, which costs one
 # rebuild and is the whole point of having a version in the header.
-CACHE_VER = 9
+CACHE_VER = 10
 CACHE_HEAD = '<HHIIId'
 CACHE_HLEN = len(CACHE_MAGIC) + struct.calcsize(CACHE_HEAD)
 

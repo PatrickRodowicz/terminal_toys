@@ -26,7 +26,7 @@ import time
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(PROJ, 'scan.py')
 
-BOUND = (list(' [],.jkr\tewlgsizhp?0123456damvcfnbLS-=')
+BOUND = (list(' [],.jkr\tewlgsizhp?0123456damvcfnNbLS-=')
          + ['\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D'])
 UNBOUND = [k for k in list('otuxy789/\\`~')
            + ['\x1b[1;2A', '\x1b[<0;10;10M', '\x1b[200~', '\x1b']]

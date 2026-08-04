@@ -19,7 +19,7 @@ from .cache import cache_path, cache_read, cache_write
 from .decimate import decimate_to
 from .model import MODEL_H, Model, apply_norm, normalise
 from .occlusion import face_ao
-from .segment import (SECTIONS, face_sections, section_centroid,
+from .segment import (SECTIONS, face_sections, present, section_centroid,
                       section_share, segment_solid)
 from .stl import analyse_stl, load_stl
 from .thermal import heat_field
@@ -99,6 +99,7 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
     _atot = sum(sec_area) or 1.0
     sec_area = [a / _atot for a in sec_area]
 
+    share = section_share(seccount)
     report = dict(src)
     report.update({
         'faces': len(faces), 'verts': len(verts), 'grid': ncell,
@@ -122,7 +123,8 @@ def build_model(tris, src, target, up, ao_radius, grid, note=None):
         # table is. Keeping them out also makes the cache canon-independent:
         # the same built mesh is valid whether or not you claim to know what
         # it depicts.
-        'sec_share': section_share(seccount),
+        'sec_share': share,
+        'sec_present': present(share),
         'sec_area': sec_area,
         'reactor': list(core) if core else None,
         # ...and the same point in model space, which is where the XRAY
@@ -150,6 +152,7 @@ def load_models(path, targets, up='z', ao_radius=4.0, vox=80, note=None,
     tris = None
     src = None
     grid = None
+    built = False
     for t in targets:
         cp = cache_path(path, t, up, ao_radius, vox, cache_dir)
         m = cache_read(cp, mtime) if use_cache else None
@@ -177,7 +180,15 @@ def load_models(path, targets, up='z', ao_radius=4.0, vox=80, note=None,
                                         SECTIONS.index('TORSO'))
                 grid = grid + (seclab, seccount, core, (mir[0], mir[1]))
             m = build_model(tris, src, t, up, ao_radius, grid, note)
+            built = True
             if use_cache:
                 cache_write(cp, m, mtime)
         out.append(m)
+    # A warm cache used to say nothing at all, which was fine when the only
+    # caller printed to a terminal that was about to be cleared. The in-app
+    # target acquisition shows these lines as its readout, and a readout with
+    # no lines on it looks like a hang -- so say what happened. It is also the
+    # honest alternative to miming stages that did not run.
+    if note and not built:
+        note('%d levels from cache' % len(out))
     return out

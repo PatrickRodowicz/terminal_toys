@@ -55,6 +55,18 @@ def section_names(canon):
 # what a mech with two arms and two legs must produce. Nothing in the search
 # knows the machine is symmetric, so when it agrees, that agreement is
 # evidence rather than assumption.
+#
+# Two per side is what a Timber Wolf produces; it is not what every machine
+# produces. The Marauder's arms are gauntlets slung under wide shoulders and no
+# erosion depth parts them from the trunk -- but depth 5 finds its two legs
+# perfectly, one on each side at 0.28 of the height. Requiring two per side
+# threw that away and fell through to the one-lump fallback, so the whole
+# machine reported as torso and the armour tonnage went with it.
+#
+# So two per side is the PREFERRED answer and one per side is an accepted one:
+# the sweep keeps the deepest symmetric-but-thin result as it goes and uses it
+# only if nothing better turns up. Bilateral agreement is still the evidence --
+# a lone lobe on one side and nothing on the other is noise and is refused.
 ERODE_SWEEP = (8, 7, 6, 5, 4, 3, 2)
 SEG_MIN_CELLS = 40
 SEG_LAT_FRAC = 0.10       # outboard means this far off the mirror plane
@@ -170,6 +182,7 @@ def segment_solid(solid, dims, note=None):
     comps = []
     stats = []
     depth_used = 0
+    thin = None                 # deepest one-per-side result seen so far
     for depth in ERODE_SWEEP:
         core = _erode(solid, dims, depth)
         cs = _components_3d(core, dims, SEG_MIN_CELLS)
@@ -188,23 +201,35 @@ def segment_solid(solid, dims, note=None):
         if len(left) >= 2 and len(right) >= 2:
             comps, stats, depth_used = cs, st, depth
             break
+        if thin is None and left and right:
+            thin = (cs, st, depth)
+    if not comps and thin:              # limbs on both sides, but only one each
+        comps, stats, depth_used = thin
     if not comps:                       # nothing parted: one solid lump
         comps = _components_3d(solid, dims, SEG_MIN_CELLS)
         stats = [{'i': 0, 'n': len(comps[0]) if comps else 0, 'z': 0.5,
                   'lat': 0.0}]
     if note:
-        note('limbs parted at erosion %d' % depth_used)
+        note('%d sections at erosion %d' % (len(comps), depth_used))
 
     # The trunk is simply the biggest core; everything is measured against it.
     lab_of = {0: 'TORSO'}
     # Pick per SIDE, never globally: taking 'the two largest remaining' picked
     # two components off the same shoulder and left the other arm unlabelled.
+    core_z = stats[0]['z'] if stats else 0.5
     for sgn, leg_tag, arm_tag in ((-1, 'LL', 'LA'), (1, 'RL', 'RA')):
         side = [x for x in stats[1:]
                 if (x['lat'] < -lat_min if sgn < 0 else x['lat'] > lat_min)]
         if not side:
             continue
         leg = min(side, key=lambda x: x['z'])       # a leg reaches the ground
+        if len(side) == 1 and leg['z'] >= core_z:
+            # With two lobes on a side the lower is a leg by construction. With
+            # only one there is nothing to be lower than, so height against the
+            # trunk decides: a lobe that hangs no further down than the body it
+            # is attached to is not something the machine stands on.
+            lab_of[leg['i']] = arm_tag
+            continue
         lab_of[leg['i']] = leg_tag
         rest = [x for x in side if x is not leg and x['z'] > leg['z']]
         if rest:                                    # an arm hangs, it does not
@@ -299,6 +324,17 @@ def section_centroid(lab, dims, org, s, si):
     return (org[0] + (sx / float(n) + 0.5) / s,
             org[1] + (sy / float(n) + 0.5) / s,
             org[2] + (sz / float(n) + 0.5) / s)
+
+
+def present(share):
+    """Which of the five sections this mesh actually has.
+
+    Not every machine produces five. The panels, the report and the target
+    cycle all take their section list from here rather than from SECTIONS, so
+    a section the segmentation never found is absent from the display instead
+    of being listed at 0.0 t -- which reads as a limb that has been shot off.
+    """
+    return [i for i, v in enumerate(share) if v > 0.0]
 
 
 def section_share(counts):

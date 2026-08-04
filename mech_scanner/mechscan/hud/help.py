@@ -23,7 +23,8 @@ HELP = [
     'i      idle animation     p 1-6  palette',
     'e      exploded view      z      zen (hide HUD)',
     'r      frame rate cap     0      reset',
-    'h      this help          q      quit',
+    'n N    next / prev mech   h      this help',
+    '                          q      quit',
 ]
 
 

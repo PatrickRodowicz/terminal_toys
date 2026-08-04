@@ -21,9 +21,9 @@
  The display has two panels. COMBAT (default, and only with a canon source)
  is what a gunner would want:
  designation, tonnage, loadout, heat sinks, speeds, and the armour spread over
- the machine's five sections. MESH (m) is the renderer's own report -- welded
- vertex count, whether every edge is used exactly twice, the decimation error
- against the source, facets drawn and frame rate.
+ the sections the segmentation found. MESH (m) is the renderer's own report --
+ welded vertex count, whether every edge is used exactly twice, the decimation
+ error against the source, facets drawn and frame rate.
 
  Two sources and no third, and every line says which it is. Canon is Sarna's
  and is quoted, never rounded or filled in -- Sarna assigns no body location to
@@ -61,6 +61,10 @@
     --no-chrome --no-boot --seed --dt --canon --cache-dir --up)
 
  Live controls (h for the full list):
+   n N   next / previous mech in mechs/, without leaving the sight. The build
+         runs on a worker thread while the display keeps turning the CURRENT
+         target, and the readout over it is the mesh pipeline's own progress:
+         every line is a stage that actually ran. See acquire.py.
    f     cockpit chrome: viewport frame, and a bearing tape and elevation
          ladder driven by the camera's real azimuth and tilt.
    b     replay the startup sequence.

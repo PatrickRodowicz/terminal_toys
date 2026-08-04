@@ -27,11 +27,30 @@ def _blank(ov, P, panel, rows):
         ov.text(r, 0, ' ' * panel, H, PN)
 
 
+def _present(report, vals):
+    """Section indices to draw: the ones the mesh has, that we have data for.
+
+    See segment.present. Bounded by len(vals) because the caller is about to
+    index into it.
+    """
+    pres = report.get('sec_present')
+    if pres is None:
+        pres = range(len(SECTIONS))
+    return [i for i in pres if i < len(vals)]
+
+
 def _field(ov, P, panel, r, k, v, hot=False):
+    # The value is right-aligned to the panel edge, but only until it collides
+    # with the key -- after which it starts at the key and has to be CLIPPED.
+    # It was not, and 'Earthwerks Incorporated' ran three cells past the panel
+    # and into the mech. Every value here comes from a canon.md, so its length
+    # is not something this file can know in advance; clipping is the only
+    # defence, and it costs nothing on a value that fits.
     H, HD, PN = P['hud'], P['hud_dim'], P['panel']
-    ov.text(r, 1, k[:panel - 3], HD, PN)
-    ov.text(r, max(len(k) + 2, panel - 1 - len(v)),
-            v, P['sel'] if hot else H, PN)
+    k = k[:panel - 3]
+    x = max(len(k) + 2, panel - 1 - len(v))
+    ov.text(r, 1, k, HD, PN)
+    ov.text(r, x, v[:max(0, panel - 1 - x)], P['sel'] if hot else H, PN)
 
 
 def draw_combat(ov, P, panel, rows, report, sel, canon):
@@ -77,9 +96,7 @@ def draw_combat(ov, P, panel, rows, report, sel, canon):
         # AIRFRAME with the rest of the construction trivia -- interpolating it
         # here produced 'composite a-2 ferro-fibr' and said nothing.
         lines.append(('dim', 'by measured skin area', '', False))
-        for si, _sc in enumerate(SECTIONS):
-            if si >= len(area):
-                break
+        for si in _present(report, area):
             lines.append(('bar', si, '%4.1f' % (area[si] * g('armour_t')),
                           si == sel))
         lines.append(('blank', '', '', False))
@@ -192,9 +209,7 @@ def draw_survey(ov, P, panel, rows, report, sel):
              # area and not by volume. On a shape of uniform thickness the two
              # columns agree, and that is worth being able to see.
              ('head2', 'vol', 'skin')]
-    for si, _sc in enumerate(SECTIONS):
-        if si >= len(share):
-            break
+    for si in _present(report, share):
         lines.append(('bar', si,
                       (area[si] * 100.0) if si < len(area) else 0.0))
 

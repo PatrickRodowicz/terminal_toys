@@ -14,14 +14,18 @@ Ordering in the loop is not arbitrary and two of the constraints were bugs:
     mesh panel reports the same facet count in every channel.
 """
 import math
+import os
 import random
 import shutil
 import signal
 import sys
 import time
 
+from . import canon as canon_mod
+from .acquire import Acquisition
 from .ansi import BG_DEF, CLEAR, FG_DEF, HIDE, HOME, RESET, SHOW, quant, shade
 from .emit import emit
+from .hud import acquire as acquire_hud
 from .hud import boot as boot_hud
 from .hud import chrome as chrome_hud
 from .hud import help as help_hud
@@ -30,7 +34,7 @@ from .hud.overlay import Overlay
 from .keyboard import Keyboard
 from .lighting import LIGHT_ARGS, LIGHT_NAMES
 from .mesh.builtin import pose_mech
-from .mesh.model import LOD_NAMES
+from .mesh.model import LOD_NAMES, LOD_TARGETS
 from .mesh.segment import SECTIONS, section_names
 from .palettes import PALETTES, PAL_NAMES, palette_materials
 from .raster import Raster
@@ -38,6 +42,7 @@ from .render import facets, scene
 from .render.camera import Camera
 from .render.sensors import SENSOR_NAMES
 from .render.view import View
+from .rig import Rig
 from .sweep import Scan
 from .text import commas
 
@@ -57,12 +62,40 @@ def _fps_label(f):
     return 'UNCAPPED' if not f else '%g FPS' % f
 
 
+def build_rig(mech, args, note=None, lod=None):
+    """A mech directory becomes a Rig. The ONE place that conversion happens.
+
+    Both callers need it and they run in very different places -- the command
+    line, once, printing to the terminal; and the acquisition worker thread,
+    collecting the same messages into a readout -- which is exactly why it
+    should not be written twice with a chance of drifting apart.
+    """
+    return Rig.from_stl(
+        mech.stl, targets=(args.faces,) if args.faces else LOD_TARGETS,
+        up=args.up or mech.up, ao_radius=args.ao_radius, vox=args.voxels,
+        no_ao=args.no_ao, note=note, use_cache=not args.no_cache,
+        lod=args.lod if lod is None else lod, canon=mech.canon,
+        cache_dir=args.cache_dir)
+
+
+def designation(rig, fallback):
+    """What to call the machine on screen: its canon name, or its directory."""
+    if rig.canon and rig.canon.get('name'):
+        return str(rig.canon['name'])
+    return fallback.replace('_', ' ').upper()
+
+
 class App:
     """One running sight. Owns the terminal; put it in a try/finally."""
 
-    def __init__(self, rig, args):
+    def __init__(self, rig, args, mech=None):
         self.rig = rig
         self.args = args
+        # Which machine is loaded, or None for the built-in. Needed to know
+        # where in mechs/ the n key is stepping FROM; the rig only knows its
+        # own mesh path.
+        self.mech = mech
+        self.acq = None
         self.subx = 2 if args.blocks == 'quad' else 1
 
         self.pal = args.palette
@@ -205,11 +238,21 @@ class App:
             # it has been segmented into the machine's own limbs, so there is
             # something to select between after all.
             n_sel = len(SECTIONS) if rig.stl_mode else len(rig.parts)
-            self.sel = (self.sel + (2 if k != 'k' else 0)) % (n_sel + 1) - 1
+            # Skip sections the segmentation did not find. A machine whose arms
+            # never part from its trunk has no arm to target, and stepping onto
+            # an empty one would report it at 0.0 t as though it had been shot
+            # off. NO TARGET (-1) is always in the cycle.
+            pres = (rig.report or {}).get('sec_present') if rig.stl_mode else None
+            for _ in range(n_sel + 1):
+                self.sel = (self.sel + (2 if k != 'k' else 0)) % (n_sel + 1) - 1
+                if pres is None or self.sel < 0 or self.sel in pres:
+                    break
             if rig.stl_mode:
                 self._say('NO TARGET' if self.sel < 0 else
                           section_names(rig.canon)[SECTIONS[self.sel]].upper(),
                           now)
+        elif k in ('n', 'N'):
+            self._cycle_mech(1 if k == 'n' else -1, now)
         elif k == 'b':
             self.booting, self.boot_t0 = True, now
         elif k == 'f':
@@ -300,6 +343,62 @@ class App:
         elif k == 'ESC':
             self.show_help = False
 
+    # -- changing target ---------------------------------------------------
+    def _cycle_mech(self, step, now):
+        """Step through mechs/ and start acquiring the next one.
+
+        Deliberately inert while an acquisition is already running: the
+        readout on screen is already saying what is happening, so a flash
+        saying it again is noise, and queueing a second build behind the first
+        would mean a keypress with an effect several seconds later.
+        """
+        if self.acq is not None:
+            return
+        names = canon_mod.available()
+        if not names:
+            self._say('NO MECHS IN %s' % os.path.basename(canon_mod.mechs_dir()),
+                      now, 1.6)
+            return
+        cur = os.path.basename(self.mech.dir) if self.mech else None
+        if cur in names:
+            if len(names) == 1:
+                self._say('NO OTHER MECH', now, 1.2)
+                return
+            i = (names.index(cur) + step) % len(names)
+        else:
+            # Started on the built-in, or on a bare .stl from outside mechs/.
+            # Either way there is no position in the cycle to step from, so
+            # enter it at whichever end the direction implies.
+            i = 0 if step > 0 else len(names) - 1
+        try:
+            mech = canon_mod.load_dir(
+                os.path.join(canon_mod.mechs_dir(), names[i]),
+                use_canon=self.args.canon != 'none')
+        except (OSError, ValueError) as e:
+            self._say('CANNOT LOAD %s: %s' % (names[i], e), now, 2.6)
+            return
+        args = self.args
+        lod = self.rig.lod_i if self.rig.stl_mode else args.lod
+
+        def build(note):
+            return build_rig(mech, args, note=note, lod=lod)
+
+        self.acq = Acquisition(names[i], mech, build)
+
+    def _swap_rig(self, rig, name, now):
+        """Adopt a freshly built rig. Called from the frame loop only."""
+        self.rig = rig
+        self.sel = -1
+        # A new machine is a new target, so the sweep starts over: the wipe
+        # runs down the new hull and the lock brackets stay dim until it has
+        # actually been seen. restart() is not optional -- both rigs have one
+        # part in stl_mode, so Scan.bind would find the count unchanged and
+        # keep scoring the new mesh against the old hull's facet arrays.
+        self.scan.restart()
+        self.scan.sweep = 0.0
+        self._say('LOCK · %s' % designation(rig, name), now, 1.8)
+        return rig
+
     def _set_palette(self, name, now):
         self.pal = name
         self.P = PALETTES[name]
@@ -344,6 +443,24 @@ class App:
                         self.booting = False
                         continue
                     self._key(k, now)
+
+                # ---- acquire ----
+                # The swap happens HERE, at the top of the frame, before
+                # anything below has read `rig`. Half a frame drawn against the
+                # old mesh and half against the new is the same class of bug
+                # Scan.bind already guards against, and `rig` is a local bound
+                # once outside the loop, so it has to be rebound by hand.
+                if self.acq is not None:
+                    new = self.acq.ready(now)
+                    if new is not None:
+                        rig = self._swap_rig(new, self.acq.name, now)
+                        self.mech = self.acq.mech
+                        self.acq = None
+                    elif self.acq.spent(now):
+                        self._say('NO LOCK · %s'
+                                  % self.acq.name.replace('_', ' ').upper(),
+                                  now, 2.0)
+                        self.acq = None
 
                 self.explode += (self.explode_t - self.explode) \
                     * min(1.0, dt * 4.0)
@@ -434,6 +551,27 @@ class App:
                     chrome_hud.draw(ov, self.P, panel, rows, cols, self.crew,
                                     self.az, self.el, wipey, now)
 
+                # ---- flash ----
+                # After the chrome, not before it. Row 2, not row 1: the crew
+                # line owns the right end of row 1 and a flash landing on it
+                # read as a rendering fault. But row 2 carries the viewport
+                # frame, which was drawn straight through 'LOCK · ARCHER' and
+                # broke it in half -- and an alert that the decoration can cut
+                # up is not an alert. It goes on top of everything but the
+                # readouts that are themselves modal.
+                if self.flash and now < self.flash_until:
+                    ov.text(2, max(0, cols - len(self.flash) - 3),
+                            ' ' + self.flash + ' ', self.P['panel'],
+                            self.P['alert'])
+
+                # ---- acquisition readout ----
+                # Over the viewport and not over the screen: the whole point of
+                # building on a worker thread is that the sight keeps running,
+                # and covering it would throw that away.
+                if self.acq is not None:
+                    acquire_hud.draw(ov, self.P, rows, cols, panel,
+                                     self.acq, now)
+
                 # ---- boot sequence ----
                 if self.booting:
                     if self.boot_t0 is None:
@@ -475,13 +613,6 @@ class App:
         # only thing lost by deleting them is a line of dead code. Numbers
         # about the renderer belong in the mesh panel.
         ov.text(0, 0, ' ' * cols, H, PN)
-        if self.flash and now < self.flash_until:
-            # Row 2, not row 1: the chrome's crew line owns the right end of
-            # row 1 and a flash landing on top of it looked like a rendering
-            # fault rather than a message.
-            ov.text(2, cols - len(self.flash) - 3, ' ' + self.flash + ' ',
-                    PN, P['alert'])
-
         if panel > 4:
             if rig.stl_mode and self.panel_mode == 0:
                 panels.draw_combat(ov, P, panel, rows, rig.report, self.sel,
